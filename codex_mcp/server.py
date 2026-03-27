@@ -6,11 +6,12 @@ MCP server — exposes 3 tools to Claude Code (and any MCP-compatible client):
 """
 
 import os
+import sqlite3
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from .parsers import parse_codex_sessions, parse_claude_sessions
-from .search  import search_sessions, format_hits, format_session
+from .search  import search_smart, build_fts_index, format_hits, format_session
 
 # ── Path resolution ───────────────────────────────────────────────────────────
 
@@ -29,20 +30,29 @@ CLAUDE_PATH = _resolve_path("CLAUDE_PATH", Path.home() / ".claude")
 _cache: dict | None = None
 
 
-def _load_all(sources: list[str]) -> list[dict]:
-    """Load and cache all requested sessions."""
+def _load_all(sources: list[str]) -> tuple[list[dict], sqlite3.Connection | None, dict]:
+    """
+    Load and cache all sessions, building the FTS index on first call.
+    Returns (filtered_sessions, fts_conn, session_map).
+    """
     global _cache
     if _cache is None:
-        _cache = {}
-        if CODEX_PATH:
-            _cache["codex"] = parse_codex_sessions(CODEX_PATH)
-        if CLAUDE_PATH:
-            _cache["claude"] = parse_claude_sessions(CLAUDE_PATH)
+        codex_sessions  = parse_codex_sessions(CODEX_PATH)  if CODEX_PATH  else []
+        claude_sessions = parse_claude_sessions(CLAUDE_PATH) if CLAUDE_PATH else []
+        all_sessions    = codex_sessions + claude_sessions
+
+        _cache = {
+            "codex":       codex_sessions,
+            "claude":      claude_sessions,
+            "conn":        build_fts_index(all_sessions),
+            "session_map": {s["session_id"]: s for s in all_sessions},
+        }
 
     sessions: list[dict] = []
     for src in sources:
         sessions.extend(_cache.get(src, []))
-    return sessions
+
+    return sessions, _cache["conn"], _cache["session_map"]
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────
@@ -76,11 +86,11 @@ def search_history(
     if not valid:
         return "Invalid sources. Use 'codex', 'claude', or both."
 
-    sessions = _load_all(valid)
+    sessions, conn, session_map = _load_all(valid)
     if not sessions:
         return "No sessions found. Check that CODEX_PATH / CLAUDE_PATH are correct."
 
-    hits = search_sessions(sessions, query, max_results=max_results)
+    hits = search_smart(conn, query, sessions, session_map, valid, max_results)
     return format_hits(hits, query)
 
 
@@ -96,7 +106,7 @@ def list_sessions(
     Returns session IDs needed for get_session.
     """
     sources = ["codex", "claude"] if source == "all" else [source]
-    sessions = _load_all(sources)
+    sessions, _conn, _session_map = _load_all(sources)
 
     if not sessions:
         return "No sessions found."
@@ -134,7 +144,7 @@ def get_session(
     if source not in ("codex", "claude"):
         return "source must be 'codex' or 'claude'"
 
-    sessions = _load_all([source])
+    sessions, _conn, _session_map = _load_all([source])
     session  = next((s for s in sessions if s["session_id"] == session_id), None)
 
     if not session:
