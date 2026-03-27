@@ -32,5 +32,11 @@ Homepage   = "https://github.com/Monishkumarvr/agent-history-mcp"
 Repository = "https://github.com/Monishkumarvr/agent-history-mcp"
 Issues     = "https://github.com/Monishkumarvr/agent-history-mcp/issues"
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["codex_mcp"]
