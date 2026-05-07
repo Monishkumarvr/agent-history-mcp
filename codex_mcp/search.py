@@ -27,6 +27,10 @@ class SearchHit:
     answer_text:   str | None    # assistant-side message text (may be None at session boundary)
     answer_ts:     str | None
     density_score: float = 0.0
+    graph_score:   float = 0.0
+    matched_topics: list[str] = field(default_factory=list)
+    related_topics: list[str] = field(default_factory=list)
+    why: str | None = None
 
 
 # ── Private helper — answer-aware Q&A pair ────────────────────────────────────
@@ -282,6 +286,16 @@ def format_hits(hits: list[SearchHit], query: str) -> str:
             lines.append(hit.answer_text)
         elif hit.question_text is not None:
             lines.append("[ANSWER] (no response recorded)")
+
+        if hit.why or hit.matched_topics or hit.related_topics:
+            lines.append("")
+            lines.append("[GRAPH EVIDENCE]")
+            if hit.why:
+                lines.append(hit.why)
+            if hit.matched_topics:
+                lines.append("Matched topics: " + ", ".join(hit.matched_topics[:8]))
+            if hit.related_topics:
+                lines.append("Related topics: " + ", ".join(hit.related_topics[:8]))
 
         lines.append("")
 

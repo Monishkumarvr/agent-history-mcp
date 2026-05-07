@@ -1,46 +1,75 @@
 # agent-history-mcp
 
-An MCP server that lets Claude Code search your past AI coding conversations — across both **OpenAI Codex CLI** and **Claude Code** — so you can pull relevant context from previous sessions on demand.
+An MCP server that lets Claude Code and Codex search past AI coding conversations across both **OpenAI Codex CLI** and **Claude Code**.
 
-## What it does
+It now combines two local search layers:
 
-Exposes three tools to Claude via the [Model Context Protocol](https://modelcontextprotocol.io):
+- keyword search with SQLite FTS5 and fuzzy fallback
+- a persistent local knowledge graph inspired by Graphify's "cache changed inputs, search relationships first" principle
+
+No chat history is uploaded. Codex and Claude history files are read-only; only the derived local index is written.
+
+## Tools
 
 | Tool | What it does |
 |------|-------------|
-| `search_history` | Keyword search across all past sessions. Returns matching excerpts with surrounding context. |
-| `list_sessions` | List all sessions with titles, dates, and message counts. |
-| `get_session` | Retrieve the full conversation for a specific session. |
+| `search_history` | Hybrid search across past sessions. Uses keyword/fuzzy search plus graph relevance. |
+| `search_graph` | Relationship-oriented graph search for related bugs, APIs, commands, files, and topics. |
+| `list_sessions` | List sessions with titles, dates, sources, and message counts. |
+| `get_session` | Retrieve a bounded portion of a specific session. |
+| `refresh_history_index` | Manually refresh or rebuild the derived local graph index. |
 
-**Example prompts you can use in Claude:**
-- *"Search my history for CUDA illegal address"*
-- *"Did I solve a similar sync issue before? Search for HMAC"*
-- *"List my recent Codex sessions"*
-- *"Get the full session where I fixed the GStreamer pipeline stall"*
+Example prompts:
 
-## Supported history sources
+```text
+Search my history for CUDA illegal address
+Use graph search for a similar Redis migration timeout
+Did I solve a similar HMAC issue before?
+List my recent Codex sessions
+Get the full session where I fixed the GStreamer pipeline stall
+Refresh the history index
+```
+
+## Supported History Sources
 
 | Source | Location |
 |--------|----------|
 | OpenAI Codex CLI | `~/.codex/sessions/` |
 | Claude Code | `~/.claude/projects/` |
 
-Both are read-only. Nothing is uploaded anywhere — all search happens locally.
+Override defaults with:
 
-## Requirements
+```json
+{
+  "mcpServers": {
+    "agent-history": {
+      "command": "python3",
+      "args": ["-m", "codex_mcp"],
+      "env": {
+        "CODEX_PATH": "/custom/path/.codex",
+        "CLAUDE_PATH": "/custom/path/.claude",
+        "AGENT_HISTORY_GRAPH_DB": "/custom/path/history_graph.sqlite"
+      }
+    }
+  }
+}
+```
 
-- Python 3.10+
-- [OpenAI Codex CLI](https://github.com/openai/codex) and/or [Claude Code](https://claude.ai/code) with existing session history
+If `AGENT_HISTORY_GRAPH_DB` is not set, the graph database is created at:
+
+```text
+~/.agent-history-mcp/history_graph.sqlite
+```
 
 ## Installation
 
-### Option 1 — pip from GitHub (recommended)
+### pip from GitHub
 
 ```bash
 pip install git+https://github.com/monishkumarvr/agent-history-mcp.git
 ```
 
-### Option 2 — pip from local clone
+### pip from local clone
 
 ```bash
 git clone https://github.com/monishkumarvr/agent-history-mcp.git
@@ -48,11 +77,9 @@ cd agent-history-mcp
 pip install .
 ```
 
-## Setup
+## Setup With Claude Code
 
-### 1. Register with Claude Code
-
-Add to `~/.claude/.mcp.json` (create the file if it doesn't exist):
+Add to `~/.claude/.mcp.json`:
 
 ```json
 {
@@ -65,95 +92,102 @@ Add to `~/.claude/.mcp.json` (create the file if it doesn't exist):
 }
 ```
 
-That's it. Claude Code auto-launches the server when it starts.
+Claude Code starts the server automatically when needed.
 
-### 2. Verify it's running
+## How Search Works
 
-Start Claude Code, then ask:
-
-```
-list my recent sessions
-```
-
-If you see a table of sessions, it's working.
-
-### 3. Override history paths (optional)
-
-By default the server auto-detects `~/.codex` and `~/.claude`. Override with environment variables if your paths differ:
-
-```json
-{
-  "mcpServers": {
-    "agent-history": {
-      "command": "python3",
-      "args": ["-m", "codex_mcp"],
-      "env": {
-        "CODEX_PATH": "/custom/path/.codex",
-        "CLAUDE_PATH": "/custom/path/.claude"
-      }
-    }
-  }
-}
+```text
+Claude Code / Codex
+    calls MCP tool
+agent-history server
+    refreshes graph index for changed JSONL files
+    parses Codex + Claude sessions into one message shape
+    searches FTS5/fuzzy index
+    searches persistent graph index
+    merges keyword and graph-ranked results
+returns concise Q/A excerpts and graph evidence
 ```
 
-## Usage
+The graph index extracts deterministic local entities:
 
-Once registered, the tools are available automatically in any Claude Code session. Claude will use them when relevant, or you can ask directly:
+- sessions
+- messages and Q/A turns
+- technical topics
+- file paths
+- commands
+- package/API names
+- error strings
 
-```
-Search my history for "docker compose"
-Search codex history for the redis migration
-List my last 20 Claude sessions
-Get session <id from list_sessions>
-```
+It stores deterministic `EXTRACTED` relationships:
 
-Use `sources` to narrow the search:
-```
-Search only Codex history for "pytest fixture"
-Search only Claude history for "GStreamer pipeline"
-```
+- session contains message
+- message mentions topic/path/command/API/error
+- question answered by assistant response
+- topics co-occur in a Q/A pair
+- sessions relate through shared extracted topics
 
-## Security & Privacy
+## New Chat Updates
 
-- **Read-only**: the server never writes to disk
-- **Local-only**: no network calls; the MCP server is a subprocess communicating over stdin/stdout
-- **No credentials accessed**: `~/.codex/auth.json` is never read
-- **Conversations stay on your machine**: excerpts are passed to Claude in your active session only, same as pasting text
+Every MCP tool call performs a lightweight refresh:
 
-> **Note:** If you previously typed sensitive values (API keys, passwords, tokens) directly into a conversation, `search_history` could surface that text when Claude searches relevant terms. This is expected behaviour — it's your own history. Be mindful when sharing screen recordings or MCP logs.
+1. Discover Codex and Claude JSONL files.
+2. Compare known files by path, size, and modified time.
+3. Parse only new or changed files into the graph index.
+4. Remove indexed rows for deleted history files.
+5. Invalidate the in-memory keyword cache only when files changed.
 
-## How it works
+No background daemon is required. New chats become searchable the next time Claude or Codex calls one of the MCP tools.
 
-```
-Claude Code
-    ↓  calls MCP tool (JSON-RPC over stdin/stdout)
-agent-history server (python3 -m codex_mcp)
-    ↓  reads JSONL files
-~/.codex/sessions/**/*.jsonl       (Codex CLI sessions)
-~/.claude/projects/**/*.jsonl      (Claude Code sessions)
-    ↓  keyword search, deduplicate by session
-Returns excerpts + context window to Claude
+Manual refresh:
+
+```text
+refresh_history_index()
 ```
 
-Token-efficient by design: `search_history` returns ~500 tokens of excerpts rather than injecting full sessions (which can be 200k+ tokens each).
+Full derived-index rebuild:
 
-## File structure
-
+```text
+refresh_history_index(rebuild=true)
 ```
+
+This deletes only the derived SQLite graph database, never Codex or Claude history.
+
+## Security And Privacy
+
+- Read-only history sources: `~/.codex` and `~/.claude` are never modified.
+- Local-only indexing: no network calls or model calls are used for graph extraction.
+- No credentials accessed: `~/.codex/auth.json` is never read.
+- Derived index only: the graph database contains extracted terms and message excerpts for local search.
+
+If past conversations contain secrets, search can still surface them because it searches your local history.
+
+## Development
+
+Run tests:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Compile check:
+
+```bash
+python -m py_compile codex_mcp/parsers.py codex_mcp/search.py codex_mcp/graph.py codex_mcp/server.py
+```
+
+## File Structure
+
+```text
 codex_mcp/
-├── __init__.py
-├── __main__.py     # python -m codex_mcp entry point
-├── server.py       # FastMCP server + 3 tools
-├── parsers.py      # Codex + Claude JSONL parsers → unified format
-└── search.py       # keyword search + result formatting
-pyproject.toml
-README.md
-.gitignore
+  __init__.py
+  __main__.py
+  graph.py       # persistent local graph index and graph search
+  parsers.py     # Codex + Claude JSONL parsers
+  search.py      # keyword/fuzzy search and result formatting
+  server.py      # FastMCP server and tools
+tests/
+  test_graph.py
 ```
-
-## Contributing
-
-Issues and PRs welcome. The parsers are the most likely thing to need updates as Codex CLI and Claude Code evolve their session formats.
 
 ## License
 
