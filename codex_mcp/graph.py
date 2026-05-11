@@ -103,7 +103,7 @@ _PATH_RE = re.compile(
     r"[A-Za-z]:[\\/][^\s`'\"<>|]{3,}|"
     r"(?:\.{1,2}[\\/]|[/\\])?[A-Za-z0-9_.@()-]+(?:[\\/][A-Za-z0-9_.@() -]+)+\.[A-Za-z0-9]{1,8}|"
     r"[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|json|md|toml|yaml|yml|rs|go|java|cs|cpp|cxx|c|h|hpp|cu|cuh|sql|sh|ps1)"
-    r")"
+    r")(?![A-Za-z0-9])"
 )
 _BACKTICK_RE = re.compile(r"`([^`\n]{2,180})`")
 _COMMAND_LINE_RE = re.compile(

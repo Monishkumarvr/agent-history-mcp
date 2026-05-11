@@ -15,6 +15,7 @@ No chat history is uploaded. Codex and Claude history files are read-only; only 
 |------|-------------|
 | `search_history` | Hybrid search across past sessions. Uses keyword/fuzzy search plus graph relevance. |
 | `search_graph` | Relationship-oriented graph search for related bugs, APIs, commands, files, and topics. |
+| `suggest_skills` | Propose reusable skill ideas from repeated chat patterns, with evidence and trigger phrases. |
 | `list_sessions` | List sessions with titles, dates, sources, and message counts. |
 | `get_session` | Retrieve a bounded portion of a specific session. |
 | `refresh_history_index` | Manually refresh or rebuild the derived local graph index. |
@@ -25,6 +26,7 @@ Example prompts:
 Search my history for CUDA illegal address
 Use graph search for a similar Redis migration timeout
 Did I solve a similar HMAC issue before?
+Suggest skills I should create from my recent chats
 List my recent Codex sessions
 Get the full session where I fixed the GStreamer pipeline stall
 Refresh the history index
@@ -126,6 +128,33 @@ It stores deterministic `EXTRACTED` relationships:
 - topics co-occur in a Q/A pair
 - sessions relate through shared extracted topics
 
+## Skill Suggestions
+
+`suggest_skills` analyzes the existing graph index and returns ranked skill ideas. It does not write `SKILL.md` files and does not call a model.
+
+Each suggestion includes:
+
+- proposed skill name and stable candidate ID
+- slug
+- confidence score
+- trigger phrases
+- recurring terms
+- supporting session IDs and dates
+- why the skill is worth making
+- suggested boundaries to keep the skill narrow
+
+Example:
+
+```text
+suggest_skills(max_candidates=5, min_sessions=2)
+```
+
+Optional filters:
+
+```text
+suggest_skills(sources=["codex"], days_back=30)
+```
+
 ## New Chat Updates
 
 Every MCP tool call performs a lightweight refresh:
@@ -185,8 +214,10 @@ codex_mcp/
   parsers.py     # Codex + Claude JSONL parsers
   search.py      # keyword/fuzzy search and result formatting
   server.py      # FastMCP server and tools
+  skills.py      # chat-derived reusable skill suggestions
 tests/
   test_graph.py
+  test_skills.py
 ```
 
 ## License

@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 from .parsers import parse_codex_sessions, parse_claude_sessions
 from .search  import SearchHit, search_smart, build_fts_index, format_hits, format_session
 from .graph import DEFAULT_DB_PATH, GraphHit, HistoryGraphIndex, format_graph_hits
+from .skills import format_skill_candidates, suggest_skill_candidates
 
 # ── Path resolution ───────────────────────────────────────────────────────────
 
@@ -288,3 +289,31 @@ def refresh_history_index(rebuild: bool = False) -> str:
         f"files_unchanged: {stats['files_unchanged']}\n"
         f"sessions_indexed: {stats['sessions_indexed']}"
     )
+
+
+@mcp.tool()
+def suggest_skills(
+    sources: list[str] = ["codex", "claude"],
+    max_candidates: int = 5,
+    min_sessions: int = 2,
+    days_back: int | None = None,
+) -> str:
+    """
+    Suggest reusable skills that could be created from repeated chat patterns.
+
+    Returns ranked skill ideas with trigger phrases, supporting sessions, and
+    boundaries. This never writes SKILL.md files and never calls a model.
+    """
+    valid = [s for s in sources if s in ("codex", "claude")]
+    if not valid:
+        return "Invalid sources. Use 'codex', 'claude', or both."
+
+    _refresh_history_index()
+    candidates = suggest_skill_candidates(
+        _get_graph_index(),
+        sources=valid,
+        max_candidates=max_candidates,
+        min_sessions=min_sessions,
+        days_back=days_back,
+    )
+    return format_skill_candidates(candidates)
