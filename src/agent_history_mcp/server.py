@@ -1,8 +1,5 @@
 """
-MCP server — exposes 3 tools to Claude Code (and any MCP-compatible client):
-  • search_history   — keyword search across Codex + Claude sessions
-  • list_sessions    — list all sessions with titles and dates
-  • get_session      — retrieve full content of one session
+MCP server for searching and analyzing Codex and Claude conversation history.
 """
 
 import os
@@ -15,7 +12,7 @@ from .search  import SearchHit, search_smart, build_fts_index, format_hits, form
 from .graph import DEFAULT_DB_PATH, GraphHit, HistoryGraphIndex, format_graph_hits
 from .skills import format_skill_candidates, suggest_skill_candidates
 
-# ── Path resolution ───────────────────────────────────────────────────────────
+# Path resolution
 
 def _resolve_path(env_var: str, default: Path) -> Path | None:
     raw = os.environ.get(env_var, "")
@@ -27,7 +24,7 @@ CODEX_PATH  = _resolve_path("CODEX_PATH",  Path.home() / ".codex")
 CLAUDE_PATH = _resolve_path("CLAUDE_PATH", Path.home() / ".claude")
 
 
-# ── Session loader (lazy, cached) ─────────────────────────────────────────────
+# Session loader (lazy, cached)
 
 _cache: dict | None = None
 _graph_index: HistoryGraphIndex | None = None
@@ -133,7 +130,7 @@ def _merge_keyword_and_graph_hits(
     ]
 
 
-# ── MCP server ────────────────────────────────────────────────────────────────
+# MCP server
 
 mcp = FastMCP(
     "agent-history",
@@ -216,7 +213,7 @@ def list_sessions(
         return "No sessions found."
 
     lines = [f"{'SOURCE':<8} {'DATE':<12} {'MSGS':>5}  TITLE"]
-    lines.append("─" * 70)
+    lines.append("-" * 70)
     for s in sessions[:limit]:
         n_msgs = len(s["messages"])
         title  = s["session_title"][:48]
@@ -242,7 +239,7 @@ def get_session(
     source: "codex" | "claude"
     max_messages: limit messages returned (default 30) to control token usage.
 
-    Prefer search_history for finding context — use this only when you need
+    Prefer search_history for finding context; use this only when you need
     the full conversation flow.
     """
     if source not in ("codex", "claude"):

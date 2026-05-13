@@ -1,13 +1,88 @@
 # agent-history-mcp
 
-An MCP server that lets Claude Code and Codex search past AI coding conversations across both **OpenAI Codex CLI** and **Claude Code**.
+Local memory search for Codex and Claude Code conversations.
 
-It now combines two local search layers:
+`agent-history-mcp` is a local MCP server that lets coding agents search your past AI coding sessions across **OpenAI Codex CLI** and **Claude Code**. It keeps the history on your machine, builds a local graph index, and returns compact evidence instead of dumping full conversations into context.
 
-- keyword search with SQLite FTS5 and fuzzy fallback
-- a persistent local knowledge graph inspired by Graphify's "cache changed inputs, search relationships first" principle
+## Why This Exists
+
+Coding agents solve useful problems in one-off chats, then that knowledge disappears into JSONL history. This project turns those old sessions into a searchable local memory layer:
+
+- find previous fixes, commands, APIs, errors, and file paths
+- search Codex history from Claude Code, and Claude history from Codex-compatible MCP clients
+- use graph search for "similar problem" retrieval when exact keywords differ
+- surface repeated workflows that could become reusable skills
 
 No chat history is uploaded. Codex and Claude history files are read-only; only the derived local index is written.
+
+## Features
+
+- **Hybrid search**: SQLite FTS5 keyword search plus fuzzy fallback.
+- **Local graph search**: extracted relationships between sessions, messages, topics, commands, APIs, paths, and errors.
+- **Skill suggestions**: evidence-backed ideas for reusable skills based on repeated chat patterns.
+- **Incremental indexing**: changed JSONL files are parsed on demand; no background daemon required.
+- **Privacy-first**: no network calls or model calls are used for indexing.
+
+## Quick Start
+
+### 1. Install
+
+From GitHub:
+
+```bash
+pip install git+https://github.com/monishkumarvr/agent-history-mcp.git
+```
+
+From a local clone:
+
+```bash
+git clone https://github.com/monishkumarvr/agent-history-mcp.git
+cd agent-history-mcp
+pip install .
+```
+
+### 2. Register With Claude Code
+
+Add this to `~/.claude/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agent-history": {
+      "command": "python3",
+      "args": ["-m", "agent_history_mcp"]
+    }
+  }
+}
+```
+
+Claude Code starts the server automatically when needed.
+
+### 3. Run Your First Query
+
+Ask Claude Code:
+
+```text
+Search my history for CUDA illegal address
+```
+
+Other useful prompts:
+
+```text
+Use graph search for a similar Redis migration timeout
+Did I solve a similar HMAC issue before?
+Suggest skills I should create from my recent chats
+List my recent Codex sessions
+Get the full session where I fixed the GStreamer pipeline stall
+```
+
+### 4. Optional: Rebuild The Derived Index
+
+```text
+refresh_history_index(rebuild=true)
+```
+
+This deletes and recreates only the derived SQLite graph database. It never modifies Codex or Claude history files.
 
 ## Tools
 
@@ -15,38 +90,72 @@ No chat history is uploaded. Codex and Claude history files are read-only; only 
 |------|-------------|
 | `search_history` | Hybrid search across past sessions. Uses keyword/fuzzy search plus graph relevance. |
 | `search_graph` | Relationship-oriented graph search for related bugs, APIs, commands, files, and topics. |
-| `suggest_skills` | Propose reusable skill ideas from repeated chat patterns, with evidence and trigger phrases. |
-| `list_sessions` | List sessions with titles, dates, sources, and message counts. |
-| `get_session` | Retrieve a bounded portion of a specific session. |
-| `refresh_history_index` | Manually refresh or rebuild the derived local graph index. |
+| `suggest_skills` | Proposes evidence-backed reusable skill ideas from repeated chat patterns. |
+| `list_sessions` | Lists sessions with titles, dates, sources, and message counts. |
+| `get_session` | Retrieves a bounded portion of a specific session. |
+| `refresh_history_index` | Manually refreshes or rebuilds the derived local graph index. |
 
-Example prompts:
+## Example Outputs
+
+### `search_history`
 
 ```text
-Search my history for CUDA illegal address
-Use graph search for a similar Redis migration timeout
-Did I solve a similar HMAC issue before?
-Suggest skills I should create from my recent chats
-List my recent Codex sessions
-Get the full session where I fixed the GStreamer pipeline stall
-Refresh the history index
+Found 2 session(s) matching "CUDA illegal address":
+
+-- Result 1 ------------------------------------------
+Source : CODEX
+Session: Fix CUDA kernel crash
+Date   : 2026-05-07
+ID     : rollout-2026-05-07...
+
+[YOU ASKED]
+Fix CUDA illegal address after kernel launch
+
+[ANSWER]
+Add synchronization around the kernel launch and rerun the focused pytest case.
 ```
+
+### `search_graph`
+
+```text
+Found 1 graph result(s) matching "similar Redis migration timeout":
+
+-- Graph Result 1 ------------------------------------
+Source : CLAUDE
+Session: Redis migration debugging
+Why    : Matched extracted topics: topic:Redis, error:timeout
+Related: command:docker compose logs api, api:redis.asyncio
+```
+
+### `suggest_skills`
+
+```text
+1. Azure Deployment Troubleshooting
+   ID: skill-4f3a1b2c9e10
+   Slug: azure-deployment-troubleshooting
+   Confidence: 0.84
+   When to use: azure deployment, app service logs, az webapp
+   Evidence: 4 sessions, 2 source(s)
+   Why: Repeated deployment/debug workflow with recurring commands and failure modes.
+```
+
+Skill suggestions are not generated skill files. They are ranked, evidence-backed ideas that you can review before creating an actual `SKILL.md`.
 
 ## Supported History Sources
 
-| Source | Location |
-|--------|----------|
+| Source | Default location |
+|--------|------------------|
 | OpenAI Codex CLI | `~/.codex/sessions/` |
 | Claude Code | `~/.claude/projects/` |
 
-Override defaults with:
+Override defaults with environment variables:
 
 ```json
 {
   "mcpServers": {
     "agent-history": {
       "command": "python3",
-      "args": ["-m", "codex_mcp"],
+      "args": ["-m", "agent_history_mcp"],
       "env": {
         "CODEX_PATH": "/custom/path/.codex",
         "CLAUDE_PATH": "/custom/path/.claude",
@@ -63,51 +172,17 @@ If `AGENT_HISTORY_GRAPH_DB` is not set, the graph database is created at:
 ~/.agent-history-mcp/history_graph.sqlite
 ```
 
-## Installation
-
-### pip from GitHub
-
-```bash
-pip install git+https://github.com/monishkumarvr/agent-history-mcp.git
-```
-
-### pip from local clone
-
-```bash
-git clone https://github.com/monishkumarvr/agent-history-mcp.git
-cd agent-history-mcp
-pip install .
-```
-
-## Setup With Claude Code
-
-Add to `~/.claude/.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "agent-history": {
-      "command": "python3",
-      "args": ["-m", "codex_mcp"]
-    }
-  }
-}
-```
-
-Claude Code starts the server automatically when needed.
-
-## How Search Works
+## How It Works
 
 ```text
-Claude Code / Codex
-    calls MCP tool
-agent-history server
-    refreshes graph index for changed JSONL files
-    parses Codex + Claude sessions into one message shape
+Claude Code or another MCP client
+    calls an MCP tool
+agent-history-mcp
+    refreshes the local graph index for changed JSONL files
+    parses Codex and Claude sessions into one message shape
     searches FTS5/fuzzy index
     searches persistent graph index
-    merges keyword and graph-ranked results
-returns concise Q/A excerpts and graph evidence
+    returns concise excerpts, evidence, and graph explanations
 ```
 
 The graph index extracts deterministic local entities:
@@ -128,33 +203,6 @@ It stores deterministic `EXTRACTED` relationships:
 - topics co-occur in a Q/A pair
 - sessions relate through shared extracted topics
 
-## Skill Suggestions
-
-`suggest_skills` analyzes the existing graph index and returns ranked skill ideas. It does not write `SKILL.md` files and does not call a model.
-
-Each suggestion includes:
-
-- proposed skill name and stable candidate ID
-- slug
-- confidence score
-- trigger phrases
-- recurring terms
-- supporting session IDs and dates
-- why the skill is worth making
-- suggested boundaries to keep the skill narrow
-
-Example:
-
-```text
-suggest_skills(max_candidates=5, min_sessions=2)
-```
-
-Optional filters:
-
-```text
-suggest_skills(sources=["codex"], days_back=30)
-```
-
 ## New Chat Updates
 
 Every MCP tool call performs a lightweight refresh:
@@ -165,30 +213,23 @@ Every MCP tool call performs a lightweight refresh:
 4. Remove indexed rows for deleted history files.
 5. Invalidate the in-memory keyword cache only when files changed.
 
-No background daemon is required. New chats become searchable the next time Claude or Codex calls one of the MCP tools.
-
-Manual refresh:
-
-```text
-refresh_history_index()
-```
-
-Full derived-index rebuild:
-
-```text
-refresh_history_index(rebuild=true)
-```
-
-This deletes only the derived SQLite graph database, never Codex or Claude history.
+New chats become searchable the next time Claude or Codex calls one of the MCP tools.
 
 ## Security And Privacy
 
-- Read-only history sources: `~/.codex` and `~/.claude` are never modified.
-- Local-only indexing: no network calls or model calls are used for graph extraction.
-- No credentials accessed: `~/.codex/auth.json` is never read.
-- Derived index only: the graph database contains extracted terms and message excerpts for local search.
+- History sources are read-only: `~/.codex` and `~/.claude` are never modified.
+- Indexing is local-only: no network calls or model calls are used.
+- Credentials are not read: `~/.codex/auth.json` is never accessed.
+- The derived graph database can contain extracted terms and message excerpts for local search.
 
-If past conversations contain secrets, search can still surface them because it searches your local history.
+If past conversations contain secrets, search can surface them because it searches your local history.
+
+## Limitations
+
+- Deterministic graph extraction can be noisy, especially for broad or generic topics.
+- Skill suggestions are candidates, not guaranteed complete skills.
+- The first index build may take time on large histories.
+- Search quality depends on the structure and content of your saved Codex and Claude JSONL files.
 
 ## Development
 
@@ -201,23 +242,34 @@ python -m unittest discover -s tests
 Compile check:
 
 ```bash
-python -m py_compile codex_mcp/parsers.py codex_mcp/search.py codex_mcp/graph.py codex_mcp/server.py
+python -m py_compile src/agent_history_mcp/*.py tests/*.py
+```
+
+Packaging check:
+
+```bash
+python -m pip install . --dry-run --no-deps
 ```
 
 ## File Structure
 
 ```text
-codex_mcp/
-  __init__.py
-  __main__.py
-  graph.py       # persistent local graph index and graph search
-  parsers.py     # Codex + Claude JSONL parsers
-  search.py      # keyword/fuzzy search and result formatting
-  server.py      # FastMCP server and tools
-  skills.py      # chat-derived reusable skill suggestions
-tests/
-  test_graph.py
-  test_skills.py
+agent-history-mcp/
+  pyproject.toml
+  README.md
+  LICENSE
+  src/
+    agent_history_mcp/
+      __init__.py
+      __main__.py
+      graph.py
+      parsers.py
+      search.py
+      server.py
+      skills.py
+  tests/
+    test_graph.py
+    test_skills.py
 ```
 
 ## License

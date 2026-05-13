@@ -5,11 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-history-mcp"
 version = "0.3.0"
-description = "MCP server to search Codex CLI + Claude Code conversation history"
+description = "Local MCP memory search for Codex CLI and Claude Code conversation history"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Monish" }]
-keywords = ["mcp", "openai", "codex", "claude", "history", "search", "terminal"]
+keywords = ["mcp", "openai", "codex", "claude", "history", "search", "memory", "terminal"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.scripts]
-agent-history-mcp = "codex_mcp.server:mcp.run"
+agent-history-mcp = "agent_history_mcp.server:mcp.run"
 
 [project.urls]
 Homepage   = "https://github.com/Monishkumarvr/agent-history-mcp"
@@ -33,4 +33,4 @@ Repository = "https://github.com/Monishkumarvr/agent-history-mcp"
 Issues     = "https://github.com/Monishkumarvr/agent-history-mcp/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["codex_mcp"]
+packages = ["src/agent_history_mcp"]

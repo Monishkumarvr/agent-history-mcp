@@ -1,10 +1,13 @@
 import json
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
-from codex_mcp.graph import HistoryGraphIndex, extract_graph_terms
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from agent_history_mcp.graph import HistoryGraphIndex, extract_graph_terms
 
 
 def _append_jsonl(path: Path, obj: dict) -> None:

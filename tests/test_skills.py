@@ -1,9 +1,12 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from codex_mcp.graph import HistoryGraphIndex
-from codex_mcp.skills import format_skill_candidates, suggest_skill_candidates
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from agent_history_mcp.graph import HistoryGraphIndex
+from agent_history_mcp.skills import format_skill_candidates, suggest_skill_candidates
 
 from test_graph import _append_jsonl, _codex_msg
 

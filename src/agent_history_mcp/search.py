@@ -2,10 +2,10 @@
 Search across unified session message lists.
 
 Three-layer approach:
-  1. FTS5 (stdlib sqlite3) — BM25 ranking, multi-word AND, phrase search, prefix search
-  2. Session density scoring — match_count / total_messages ranks sessions by topic relevance
-  3. Answer-aware context — returns Q→A pairs (problem + solution) instead of ±N neighbours
-  4. rapidfuzz fallback — handles typos and 0-result FTS5 queries
+  1. FTS5 (stdlib sqlite3): BM25 ranking, multi-word AND, phrase search, prefix search
+  2. Session density scoring: match_count / total_messages ranks sessions by topic relevance
+  3. Answer-aware context: returns Q/A pairs (problem + solution) instead of +/-N neighbours
+  4. rapidfuzz fallback: handles typos and 0-result FTS5 queries
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 
-# ── Data model ────────────────────────────────────────────────────────────────
+# Data model
 
 @dataclass
 class SearchHit:
@@ -21,7 +21,7 @@ class SearchHit:
     session_title: str
     session_date:  str
     source:        str           # "codex" | "claude"
-    matched_role:  str           # "user" | "assistant" — which message triggered the match
+    matched_role:  str           # "user" | "assistant"; which message triggered the match
     question_text: str | None    # user-side message text (may be None at session boundary)
     question_ts:   str | None
     answer_text:   str | None    # assistant-side message text (may be None at session boundary)
@@ -33,7 +33,7 @@ class SearchHit:
     why: str | None = None
 
 
-# ── Private helper — answer-aware Q&A pair ────────────────────────────────────
+# Private helper: answer-aware Q&A pair
 
 def _build_qa_pair(
     session: dict,
@@ -68,7 +68,7 @@ def _build_qa_pair(
     return question, answer
 
 
-# ── FTS5 index ────────────────────────────────────────────────────────────────
+# FTS5 index
 
 def build_fts_index(sessions: list[dict]) -> sqlite3.Connection | None:
     """
@@ -102,7 +102,7 @@ def build_fts_index(sessions: list[dict]) -> sqlite3.Connection | None:
         return None
 
 
-# ── FTS5 search ───────────────────────────────────────────────────────────────
+# FTS5 search
 
 def search_fts(
     conn: sqlite3.Connection,
@@ -112,7 +112,7 @@ def search_fts(
     max_results: int,
 ) -> list[SearchHit]:
     """
-    BM25-ranked FTS5 search → density scoring → answer-aware Q&A pairs.
+    BM25-ranked FTS5 search -> density scoring -> answer-aware Q&A pairs.
     Raises sqlite3.OperationalError on malformed query (caller handles it).
     """
     sources_set = set(sources)
@@ -178,7 +178,7 @@ def search_fts(
     return hits
 
 
-# ── rapidfuzz fallback ────────────────────────────────────────────────────────
+# rapidfuzz fallback
 
 def search_fuzzy(
     sessions: list[dict],
@@ -232,7 +232,7 @@ def search_fuzzy(
     return hits
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────────
+# Orchestrator
 
 def search_smart(
     conn: sqlite3.Connection | None,
@@ -243,7 +243,7 @@ def search_smart(
     max_results: int = 5,
 ) -> list[SearchHit]:
     """
-    FTS5 → density ranking → answer-aware pairs → fuzzy fallback.
+    FTS5 -> density ranking -> answer-aware pairs -> fuzzy fallback.
     """
     if conn is not None:
         try:
@@ -251,12 +251,12 @@ def search_smart(
             if hits:
                 return hits
         except sqlite3.OperationalError:
-            pass  # malformed query → fall through to fuzzy
+            pass  # malformed query -> fall through to fuzzy
 
     return search_fuzzy(sessions, query, max_results)
 
 
-# ── Formatters ────────────────────────────────────────────────────────────────
+# Formatters
 
 def format_hits(hits: list[SearchHit], query: str) -> str:
     """Format search hits as readable text for Claude's context."""
@@ -267,7 +267,7 @@ def format_hits(hits: list[SearchHit], query: str) -> str:
 
     for i, hit in enumerate(hits, 1):
         lines.append(
-            f"── Result {i} ──────────────────────────────────────────\n"
+            f"-- Result {i} ------------------------------------------\n"
             f"Source : {hit.source.upper()}\n"
             f"Session: {hit.session_title}\n"
             f"Date   : {hit.session_date}\n"
@@ -314,7 +314,7 @@ def format_session(session: dict, max_messages: int = 30) -> str:
         f"ID     : {session['session_id'][:36]}",
         f"Messages: {len(session['messages'])}"
         + (f" (showing first {max_messages})" if truncated else ""),
-        "─" * 60,
+        "-" * 60,
     ]
 
     for msg in msgs:
