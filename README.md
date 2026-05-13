@@ -215,6 +215,61 @@ Every MCP tool call performs a lightweight refresh:
 
 New chats become searchable the next time Claude or Codex calls one of the MCP tools.
 
+## Benchmarks
+
+Run the local benchmark:
+
+```bash
+python benchmarks/benchmark_retrieval.py
+```
+
+The benchmark compares:
+
+- full JSONL parsing
+- in-memory FTS index build and query
+- cold graph index build
+- warm graph refresh with unchanged files
+- graph search query time
+- graph-only candidate expansion versus FTS results
+- skill suggestion time
+
+### Local Benchmark Results
+
+These numbers were measured on one local Windows laptop against its saved Codex/Claude histories. They are useful as a directional signal, not a universal performance claim.
+
+- Corpus: 43 sessions, 2,434 parsed messages, 2,741,934 message characters
+- History files seen: 48
+- Query repeat count: 5
+- Max results per query: 5
+
+| Operation | Mean / elapsed time | Notes |
+|-----------|---------------------|-------|
+| Parse JSONL sessions | 676.1 ms | Full parser pass over Codex and Claude history |
+| Build in-memory FTS index | 28.5 ms | SQLite FTS5 over parsed messages |
+| Cold graph index build | 15,958.6 ms | One-time derived graph build for 43 indexed sessions |
+| Warm graph refresh | 20.7 ms | Unchanged files checked by metadata; no JSONL reparse |
+| Raw JSONL + FTS rebuild + search | 1,324.1 ms | Mean over 3 representative cold queries |
+| Skill suggestion pass | 7,376.1 ms | Returned 5 candidates |
+
+| Query | FTS query ms | Graph query ms | FTS hits | Graph hits | Graph-only hits |
+|-------|--------------|----------------|----------|------------|-----------------|
+| `history search graph` | 0.53 | 3.23 | 5 | 5 | 4 |
+| `git push` | 0.73 | 22.35 | 5 | 5 | 4 |
+| `permission denied` | 0.35 | 12.06 | 5 | 5 | 1 |
+| `pytest fixture` | 0.46 | 0.32 | 0 | 0 | 0 |
+| `redis migration timeout` | 0.32 | 22.85 | 2 | 5 | 3 |
+| `azure deployment` | 0.15 | 0.24 | 3 | 0 | 0 |
+| `CUDA illegal address` | 0.31 | 18.13 | 4 | 5 | 4 |
+
+Across these benchmark queries, FTS returned 24 query-result sessions and graph search returned 25. The graph layer added 16 graph-only candidate sessions that keyword search did not return for the same query set.
+
+Interpretation:
+
+- The speed win is not that graph query beats an already-hot FTS query. Hot FTS is extremely fast.
+- The practical speed win is warm refresh: repeated MCP calls check unchanged files in about 20 ms instead of reparsing JSONL and rebuilding search state.
+- The retrieval win is candidate expansion: graph search can surface related sessions through extracted relationships even when exact keywords differ.
+- Graph-only hits are additional evidence-backed candidates, not guaranteed correct answers.
+
 ## Security And Privacy
 
 - History sources are read-only: `~/.codex` and `~/.claude` are never modified.
@@ -251,6 +306,12 @@ Packaging check:
 python -m pip install . --dry-run --no-deps
 ```
 
+Benchmark check:
+
+```bash
+python benchmarks/benchmark_retrieval.py
+```
+
 ## File Structure
 
 ```text
@@ -258,6 +319,8 @@ agent-history-mcp/
   pyproject.toml
   README.md
   LICENSE
+  benchmarks/
+    benchmark_retrieval.py
   src/
     agent_history_mcp/
       __init__.py

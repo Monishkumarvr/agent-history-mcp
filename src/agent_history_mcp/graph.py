@@ -637,16 +637,24 @@ class HistoryGraphIndex:
         rows = self.conn.execute(
             f"""
             SELECT n.kind, n.value, MAX(e.weight) AS weight
-            FROM edges e
-            JOIN nodes n ON n.node_key = CASE WHEN e.src_key IN ({placeholders}) THEN e.dst_key ELSE e.src_key END
-            WHERE e.relation = 'co_occurs_with'
-              AND (e.src_key IN ({placeholders}) OR e.dst_key IN ({placeholders}))
-              AND n.kind NOT IN ('session', 'message')
-            GROUP BY n.node_key, n.kind, n.value
+            FROM (
+                SELECT dst_key AS term_key, weight
+                FROM edges
+                WHERE relation = 'co_occurs_with'
+                  AND src_key IN ({placeholders})
+                UNION ALL
+                SELECT src_key AS term_key, weight
+                FROM edges
+                WHERE relation = 'co_occurs_with'
+                  AND dst_key IN ({placeholders})
+            ) e
+            JOIN nodes n ON n.node_key = e.term_key
+            WHERE n.kind NOT IN ('session', 'message')
+            GROUP BY e.term_key, n.kind, n.value
             ORDER BY weight DESC, n.value ASC
             LIMIT ?
             """,
-            (*term_keys, *term_keys, *term_keys, limit),
+            (*term_keys, *term_keys, limit),
         ).fetchall()
         return [f"{row['kind']}:{row['value']}" for row in rows]
 
