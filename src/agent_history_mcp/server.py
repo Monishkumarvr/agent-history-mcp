@@ -5,7 +5,10 @@ MCP server for searching and analyzing Codex and Claude conversation history.
 import os
 import sqlite3
 from pathlib import Path
-from mcp.server.fastmcp import FastMCP
+try:  # MCP Python SDK 2.x renamed FastMCP to MCPServer; keep 1.x working too.
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:
+    from mcp.server.fastmcp import FastMCP
 
 from .parsers import parse_codex_sessions, parse_claude_sessions
 from .search  import SearchHit, search_smart, build_fts_index, format_hits, format_session

@@ -8,24 +8,24 @@ explainable SQLite graph that can be refreshed incrementally from JSONL history.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .parsers import (
-    iter_claude_session_files,
-    iter_codex_session_files,
-    load_codex_title_index,
-    parse_claude_session_file,
-    parse_codex_session_file,
-)
+from .model import Event, agent_home, project_root
+from .sources import SOURCE_NAMES, SourceAdapter
+from .sources.claude import ClaudeAdapter
+from .sources.codex import CodexAdapter
 
 
-DEFAULT_DB_PATH = Path.home() / ".agent-history-mcp" / "history_graph.sqlite"
+DEFAULT_DB_PATH = agent_home() / "history_graph.sqlite"
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,8 @@ class RefreshStats:
     files_removed: int = 0
     files_unchanged: int = 0
     sessions_indexed: int = 0
+    per_source: dict[str, int] = field(default_factory=dict)
+    diagnostics: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -199,6 +201,48 @@ def extract_graph_terms(text: str, max_terms: int = 80) -> list[GraphTerm]:
     return sorted(terms.values(), key=lambda t: (-t.weight, t.kind, t.norm))[:max_terms]
 
 
+def session_filters(
+    sources: list[str] | None,
+    project: str | None,
+    days_back: int | None,
+    alias: str = "s",
+) -> tuple[list[str], list]:
+    """SQL WHERE clauses shared by every query that scopes sessions."""
+    clauses: list[str] = []
+    params: list = []
+    if sources is not None:
+        valid = [s for s in sources if s in SOURCE_NAMES]
+        clauses.append(f"{alias}.source IN ({','.join('?' for _ in valid) or 'NULL'})")
+        params.extend(valid)
+    if project:
+        root = project_root(project)
+        clauses.append(f"({alias}.project = ? OR {alias}.cwd = ? OR {alias}.cwd LIKE ?)")
+        params.extend([root, root, root.rstrip("/") + "/%"])
+    if days_back is not None and days_back > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        clauses.append(f"({alias}.ended_at >= ? OR ({alias}.ended_at = '' AND {alias}.session_date >= ?))")
+        params.extend([cutoff, cutoff[:10]])
+    return clauses, params
+
+
+def event_from_row(row: sqlite3.Row) -> Event:
+    return Event(
+        idx=row["idx"],
+        ts=row["ts"] or "",
+        kind=row["kind"],
+        text=row["text"] or "",
+        tool=row["tool"] or "",
+        canon_tool=row["canon_tool"] or "",
+        command=row["command"] or "",
+        cmd_sig=row["cmd_sig"] or "",
+        paths=json.loads(row["paths"]) if row["paths"] else [],
+        is_error=bool(row["is_error"]),
+        exit_code=row["exit_code"],
+        call_id=row["call_id"] or "",
+        meta=json.loads(row["meta"]) if row["meta"] else {},
+    )
+
+
 def _session_key(source: str, session_id: str) -> str:
     return f"session:{source}:{session_id}"
 
@@ -217,15 +261,28 @@ class HistoryGraphIndex:
         self._init_schema()
 
     def _init_schema(self) -> None:
+        self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        if row is None or row["value"] != str(SCHEMA_VERSION):
+            # The database is derived from history files, so an old schema is simply rebuilt.
+            # installed_skills is our own record of writes and survives the rebuild.
+            tables = [
+                r["name"]
+                for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+                if r["name"] not in ("meta", "installed_skills") and not r["name"].startswith("sqlite_")
+            ]
+            for table in tables:
+                self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+            )
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
                 session_key TEXT,
-                mtime_ns INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                sha256 TEXT,
+                change_token TEXT NOT NULL,
                 updated_at REAL NOT NULL
             );
 
@@ -235,7 +292,47 @@ class HistoryGraphIndex:
                 source TEXT NOT NULL,
                 title TEXT NOT NULL,
                 session_date TEXT NOT NULL,
-                path TEXT NOT NULL
+                path TEXT NOT NULL,
+                cwd TEXT NOT NULL DEFAULT '',
+                project TEXT NOT NULL DEFAULT '',
+                git_branch TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL DEFAULT '',
+                ended_at TEXT NOT NULL DEFAULT '',
+                n_messages INTEGER NOT NULL DEFAULT 0,
+                n_user INTEGER NOT NULL DEFAULT 0,
+                n_tool_calls INTEGER NOT NULL DEFAULT 0,
+                n_errors INTEGER NOT NULL DEFAULT 0,
+                tools_available INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                session_key TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                ts TEXT,
+                kind TEXT NOT NULL,
+                text TEXT,
+                tool TEXT,
+                canon_tool TEXT,
+                command TEXT,
+                cmd_sig TEXT,
+                paths TEXT,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                exit_code INTEGER,
+                call_id TEXT,
+                meta TEXT,
+                PRIMARY KEY(session_key, idx)
+            );
+
+            CREATE TABLE IF NOT EXISTS installed_skills (
+                name TEXT NOT NULL,
+                path TEXT PRIMARY KEY,
+                sha256 TEXT NOT NULL,
+                candidate_id TEXT,
+                steps TEXT,
+                installed_at REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -280,6 +377,8 @@ class HistoryGraphIndex:
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project, ended_at);
+            CREATE INDEX IF NOT EXISTS idx_events_tool ON events(canon_tool, cmd_sig);
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_key, msg_idx);
             CREATE INDEX IF NOT EXISTS idx_message_terms_term ON message_terms(term_key);
             CREATE INDEX IF NOT EXISTS idx_session_terms_term ON session_terms(term_key);
@@ -292,57 +391,142 @@ class HistoryGraphIndex:
     def close(self) -> None:
         self.conn.close()
 
-    def refresh(self, codex_path: Path | None, claude_path: Path | None) -> RefreshStats:
+    # Read helpers shared by search, handoff, analytics, and skills
+
+    def session_rows(
+        self,
+        sources: list[str] | None = None,
+        project: str | None = None,
+        days_back: int | None = None,
+        limit: int | None = None,
+        order: str = "ended_at DESC",
+    ) -> list[sqlite3.Row]:
+        clauses, params = session_filters(sources, project, days_back)
+        sql = f"SELECT * FROM sessions s WHERE {' AND '.join(clauses) or '1=1'} ORDER BY {order}"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return self.conn.execute(sql, params).fetchall()
+
+    def events_for(self, session_key: str, kinds: tuple[str, ...] | None = None) -> list[Event]:
+        sql = "SELECT * FROM events WHERE session_key = ?"
+        params: list = [session_key]
+        if kinds:
+            sql += f" AND kind IN ({','.join('?' for _ in kinds)})"
+            params.extend(kinds)
+        sql += " ORDER BY idx"
+        return [event_from_row(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def load_sessions(self, sources: list[str] | None = None, project: str | None = None) -> list[dict]:
+        """Rebuild session/message dicts from the index for keyword search (no JSONL re-parse)."""
+        rows = self.session_rows(sources, project, order="session_date DESC, ended_at DESC")
+        sessions: dict[str, dict] = {}
+        for row in rows:
+            sessions[row["session_key"]] = {
+                "session_id": row["session_id"],
+                "session_title": row["title"],
+                "session_date": row["session_date"],
+                "source": row["source"],
+                "session_key": row["session_key"],
+                "project": row["project"],
+                "messages": [],
+            }
+        if not sessions:
+            return []
+        for msg in self.conn.execute("SELECT session_key, role, text, ts FROM messages ORDER BY session_key, msg_idx"):
+            session = sessions.get(msg["session_key"])
+            if session is None:
+                continue
+            session["messages"].append({
+                "role": msg["role"],
+                "text": msg["text"],
+                "ts": msg["ts"] or "",
+                "session_id": session["session_id"],
+                "session_title": session["session_title"],
+                "session_date": session["session_date"],
+                "source": session["source"],
+            })
+        return [s for s in sessions.values() if s["messages"]]
+
+    def find_session(self, session_id: str, source: str | None = None) -> sqlite3.Row | None:
+        sql = "SELECT * FROM sessions WHERE (session_id = ? OR session_id LIKE ?)"
+        params: list = [session_id, f"{session_id}%"]
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        return self.conn.execute(sql + " ORDER BY session_id = ? DESC LIMIT 1", (*params, session_id)).fetchone()
+
+    def refresh(
+        self,
+        codex_path: Path | None = None,
+        claude_path: Path | None = None,
+        adapters: list[SourceAdapter] | None = None,
+    ) -> RefreshStats:
+        """
+        Incrementally sync the index with every adapter's units. Passing
+        codex_path/claude_path keeps the original two-source API.
+        """
         stats = RefreshStats()
-        discovered: list[tuple[Path, str, dict[str, str] | None]] = []
+        if adapters is None:
+            adapters = []
+            if codex_path:
+                adapters.append(CodexAdapter(codex_path))
+            if claude_path:
+                adapters.append(ClaudeAdapter(claude_path))
 
-        if codex_path and codex_path.is_dir():
-            title_index = load_codex_title_index(codex_path)
-            discovered.extend((path, "codex", title_index) for path in iter_codex_session_files(codex_path))
-        if claude_path and claude_path.is_dir():
-            discovered.extend((path, "claude", None) for path in iter_claude_session_files(claude_path))
-
-        discovered_by_path = {str(path.resolve()): (path, source, title_index) for path, source, title_index in discovered}
-        stats.files_seen = len(discovered_by_path)
+        discovered: dict[str, tuple[SourceAdapter, object]] = {}
+        scanned_sources: set[str] = set()
+        for adapter in adapters:
+            adapter.diagnostics = []
+            try:
+                units = adapter.discover() if adapter.available() else []
+            except Exception as exc:  # an unreadable store must not break the other sources
+                stats.diagnostics.append(f"{adapter.name}: discovery failed ({type(exc).__name__}: {exc})")
+                continue
+            scanned_sources.add(adapter.name)
+            stats.diagnostics.extend(f"{adapter.name}: {msg}" for msg in adapter.diagnostics)
+            for unit in units:
+                discovered[unit.key] = (adapter, unit)
+        stats.files_seen = len(discovered)
 
         known_paths = {
             row["path"]: row
-            for row in self.conn.execute("SELECT path, session_key, mtime_ns, size FROM files").fetchall()
+            for row in self.conn.execute("SELECT path, source, session_key, change_token FROM files").fetchall()
         }
 
         for path, row in known_paths.items():
-            if path not in discovered_by_path:
+            # Only drop units of sources that were scanned; a missing source is not a deletion.
+            if path not in discovered and row["source"] in scanned_sources:
                 if row["session_key"]:
                     self._delete_session(row["session_key"])
                 self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
                 stats.files_removed += 1
 
-        for path_key, (path, source, title_index) in discovered_by_path.items():
-            stat = path.stat()
+        for path_key, (adapter, unit) in discovered.items():
             known = known_paths.get(path_key)
-            if known and known["mtime_ns"] == stat.st_mtime_ns and known["size"] == stat.st_size:
+            if known and known["change_token"] == unit.change_token:
                 stats.files_unchanged += 1
                 continue
 
             if known and known["session_key"]:
                 self._delete_session(known["session_key"])
 
-            session = (
-                parse_codex_session_file(path, title_index)
-                if source == "codex"
-                else parse_claude_session_file(path)
-            )
+            try:
+                session = adapter.parse(unit)
+            except Exception as exc:
+                stats.diagnostics.append(f"{adapter.name}: could not parse {path_key} ({type(exc).__name__})")
+                session = None
             session_key = None
             if session:
                 session_key = self._index_session(session, path_key)
                 stats.sessions_indexed += 1
+                stats.per_source[adapter.name] = stats.per_source.get(adapter.name, 0) + 1
 
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO files(path, source, session_key, mtime_ns, size, sha256, updated_at)
-                VALUES (?, ?, ?, ?, ?, NULL, ?)
+                INSERT OR REPLACE INTO files(path, source, session_key, change_token, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (path_key, source, session_key, stat.st_mtime_ns, stat.st_size, time.time()),
+                (path_key, adapter.name, session_key, unit.change_token, time.time()),
             )
             if known:
                 stats.files_changed += 1
@@ -392,6 +576,7 @@ class HistoryGraphIndex:
             self.conn.execute(f"DELETE FROM edges WHERE src_key IN ({placeholders}) OR dst_key IN ({placeholders})", keys * 2)
             self.conn.execute(f"DELETE FROM message_terms WHERE message_key IN ({placeholders})", keys)
         self.conn.execute("DELETE FROM session_terms WHERE session_key = ?", (session_key,))
+        self.conn.execute("DELETE FROM events WHERE session_key = ?", (session_key,))
         self.conn.execute("DELETE FROM messages WHERE session_key = ?", (session_key,))
         self.conn.execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
         self.conn.execute("DELETE FROM nodes WHERE node_key = ?", (session_key,))
@@ -403,16 +588,57 @@ class HistoryGraphIndex:
         session_id = session["session_id"]
         session_key = _session_key(source, session_id)
         self._insert_node(session_key, "session", session["session_title"])
+        events = session.get("events") or []
         self.conn.execute(
             """
-            INSERT OR REPLACE INTO sessions(session_key, session_id, source, title, session_date, path)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO sessions(
+                session_key, session_id, source, title, session_date, path,
+                cwd, project, git_branch, model, input_tokens, output_tokens,
+                started_at, ended_at, n_messages, n_user, n_tool_calls, n_errors, tools_available
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_key, session_id, source, session["session_title"], session["session_date"], path),
+            (
+                session_key, session_id, source, session["session_title"], session["session_date"], path,
+                session.get("cwd", ""), session.get("project", ""), session.get("git_branch", ""),
+                session.get("model", ""), session.get("input_tokens", 0), session.get("output_tokens", 0),
+                session.get("started_at", ""), session.get("ended_at", ""), len(session["messages"]),
+                sum(1 for m in session["messages"] if m["role"] == "user"),
+                sum(1 for e in events if e.kind == "tool_call"),
+                sum(1 for e in events if e.kind == "tool_result" and e.is_error),
+                1 if session.get("tools_available", True) else 0,
+            ),
+        )
+        self.conn.executemany(
+            """
+            INSERT OR REPLACE INTO events(
+                session_key, idx, ts, kind, text, tool, canon_tool, command, cmd_sig,
+                paths, is_error, exit_code, call_id, meta
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(session_key, *event.as_row()) for event in events],
         )
 
         session_term_weights: defaultdict[str, float] = defaultdict(float)
         message_terms_by_idx: dict[int, list[GraphTerm]] = {}
+
+        # Structured tool calls are stronger evidence than regex hits in prose.
+        for event in events:
+            if event.kind != "tool_call":
+                continue
+            structured: list[tuple[str, str, float]] = []
+            if event.command:
+                structured.append(("command", event.command.splitlines()[0][:180], 4.5))
+            if event.canon_tool in ("edit", "write"):
+                structured.extend(("path", p, 4.5) for p in event.paths[:5])
+            for kind, value, weight in structured:
+                norm = _norm(value)
+                if len(norm) < 3:
+                    continue
+                term = GraphTerm(kind=kind, value=_clean_value(value), norm=norm, weight=weight)
+                self._insert_node(term.key, term.kind, term.value)
+                session_term_weights[term.key] += weight
 
         for idx, msg in enumerate(session["messages"]):
             message_key = _message_key(source, session_id, idx)
@@ -509,7 +735,7 @@ class HistoryGraphIndex:
         if not query_terms:
             return []
 
-        source_set = {s for s in sources if s in ("codex", "claude")}
+        source_set = {s for s in sources if s in SOURCE_NAMES}
         if not source_set:
             return []
 
