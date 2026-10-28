@@ -12,8 +12,9 @@ try:  # MCP Python SDK 2.x renamed FastMCP to MCPServer; keep 1.x working too.
     from mcp.server.mcpserver import MCPServer as FastMCP
 except ImportError:
     from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
-from . import handoff
+from . import handoff, memory_sync
 from .graph import DEFAULT_DB_PATH, GraphHit, HistoryGraphIndex, format_graph_hits
 from .redact import redact
 from .search import SearchHit, build_fts_index, format_hits, format_session, search_smart
@@ -410,6 +411,65 @@ def save_checkpoint(note: str, project: str | None = None, apply: bool = False) 
     """
     _refresh_history_index()
     return handoff.save_checkpoint(_get_graph_index(), note, project, apply=apply)
+
+
+@mcp.tool()
+@_redacted
+def list_agent_memory(project: str | None = None) -> str:
+    """
+    Show which instruction and memory files each agent reads for a repository,
+    and the drift between them (rules one agent sees but another doesn't).
+
+    Covers CLAUDE.md, Claude auto-memory, AGENTS.md (Codex/Cursor/OpenCode),
+    GEMINI.md, .cursor/rules, and Codex memories at project and user level.
+    """
+    _refresh_history_index()
+    return memory_sync.list_agent_memory(_get_graph_index(), handoff.resolve_project(project))
+
+
+@mcp.tool()
+@_redacted
+def suggest_rules(
+    project: str | None = None,
+    sources: list[str] | str = "all",
+    days_back: int | None = 90,
+    min_sessions: int = 2,
+) -> str:
+    """
+    Mine your repeated corrections ("no, use pnpm"), stated preferences
+    ("always run ruff first") and rejected tool calls into candidate rules for
+    CLAUDE.md / AGENTS.md / GEMINI.md, with evidence and whether each rule is
+    already documented. Pass project="" to search all projects.
+    """
+    valid = resolve_sources(sources)
+    if not valid:
+        return f"Invalid sources. Use {SOURCES_HELP}."
+    _refresh_history_index()
+    root = handoff.resolve_project(project) if project != "" else None
+    candidates = memory_sync.suggest_rules(_get_graph_index(), root, valid, days_back, min_sessions)
+    return memory_sync.format_rule_candidates(candidates)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
+@_redacted
+def sync_memory(
+    rules: list[str] | None = None,
+    targets: list[str] | None = None,
+    project: str | None = None,
+    scope: str = "project",
+    apply: bool = False,
+) -> str:
+    """
+    Add shared rules to every agent's instruction file via a managed block.
+
+    rules: rules to add; omit to sync the drift (rules some agents are missing).
+    targets: agents to update (claude -> CLAUDE.md, codex/cursor/opencode ->
+    AGENTS.md, gemini -> GEMINI.md); defaults to agents that already have one.
+    scope: "project" (repo files) or "user" (~/.claude, ~/.codex, ~/.gemini).
+    Returns a unified diff. Writes only when apply=true, and only edits the
+    <!-- agent-history:begin/end --> block.
+    """
+    return memory_sync.sync_memory(handoff.resolve_project(project), rules, targets, scope, apply)
 
 
 def run() -> None:

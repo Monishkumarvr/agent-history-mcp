@@ -78,6 +78,8 @@ def _claude_tool(step: tuple) -> tuple[str, dict, str, bool]:
         return "TodoWrite", {"todos": [{"content": t, "status": s, "activeForm": t} for t, s in step[1]]}, "ok", False
     if kind == "skill":
         return "Skill", {"skill": step[1]}, "loaded", False
+    if kind == "rejected":
+        return "Bash", {"command": step[1]}, "The user doesn't want to proceed with this tool use. The tool use was rejected.", True
     raise ValueError(kind)
 
 

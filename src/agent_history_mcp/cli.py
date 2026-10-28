@@ -78,6 +78,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project")
     p.add_argument("--apply", action="store_true", help="also write .agent-context/HANDOFF.md in the repo")
 
+    p = sub.add_parser("memory", help="show instruction/memory files per agent and their drift")
+    p.add_argument("--project")
+
+    p = sub.add_parser("rules", help="suggest rules from your repeated corrections")
+    p.add_argument("--project", help="repository path; use --all-projects to search everywhere")
+    p.add_argument("--all-projects", action="store_true")
+    p.add_argument("--days-back", type=int, default=90)
+    p.add_argument("--min-sessions", type=int, default=2)
+
+    p = sub.add_parser("sync-memory", help="sync rules into CLAUDE.md / AGENTS.md / GEMINI.md (dry run by default)")
+    p.add_argument("--rule", action="append", dest="rules", help="rule to add (repeatable); omit to sync drift")
+    p.add_argument("--target", action="append", dest="targets", help="agent to update (repeatable)")
+    p.add_argument("--project")
+    p.add_argument("--scope", default="project", choices=["project", "user"])
+    p.add_argument("--apply", action="store_true")
+
     p = sub.add_parser("hook", help="agent hook entry points")
     hook_sub = p.add_subparsers(dest="hook")
     h = hook_sub.add_parser("session-start", help="Claude Code SessionStart hook: inject other agents' recent context")
@@ -113,6 +129,12 @@ def main(argv: list[str] | None = None) -> int:
         out = server.handoff_brief(args.project, _sources(args.sources), args.sessions, args.exclude_source)
     elif command == "checkpoint":
         out = server.save_checkpoint(args.note, args.project, args.apply)
+    elif command == "memory":
+        out = server.list_agent_memory(args.project)
+    elif command == "rules":
+        out = server.suggest_rules("" if args.all_projects else args.project, "all", args.days_back, args.min_sessions)
+    elif command == "sync-memory":
+        out = server.sync_memory(args.rules, args.targets, args.project, args.scope, args.apply)
     else:
         parser.print_help()
         return 2

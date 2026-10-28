@@ -20,7 +20,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0",
+    "mcp[cli]>=1.9",
     "rapidfuzz>=3.0",
 ]
 
