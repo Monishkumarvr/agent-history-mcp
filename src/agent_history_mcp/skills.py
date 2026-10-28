@@ -794,6 +794,8 @@ def skill_health(
     report: list[SkillHealth] = []
     for skill in installed:
         uses = usage.get(skill.name.lower(), [])
+        if skill.scope == "plugin" and not uses:
+            continue  # plugin bundles ship many skills; only report the ones you use
         used_keys = {u["session_key"] for u in uses}
         record = records.get(skill.name)
         steps = json.loads(record["steps"]) if record and record.get("steps") else None

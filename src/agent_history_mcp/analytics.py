@@ -175,10 +175,16 @@ def _cross_agent_comparison(index: HistoryGraphIndex, stats: dict[str, SessionSt
             by_term[(row["node_key"], row["kind"], row["value"])].add(row["session_key"])
 
     results = []
-    for (term_key, kind, value), session_keys in by_term.items():
+    seen_groups: set[frozenset[str]] = set()
+    ranked = sorted(by_term.items(), key=lambda kv: (-len(kv[1]), {"error": 0, "command": 1, "api": 2}.get(kv[0][1], 3), kv[0][2]))
+    for (term_key, kind, value), session_keys in ranked:
         sources = {stats[k].source for k in session_keys}
         if len(sources) < 2 or len(session_keys) < 3 or not _is_candidate_seed(kind, value, term_key):
             continue
+        group = frozenset(session_keys)
+        if group in seen_groups:
+            continue  # the same sessions under another term add nothing
+        seen_groups.add(group)
         per_source = {}
         for source in sorted(sources):
             group = [stats[k] for k in session_keys if stats[k].source == source]
