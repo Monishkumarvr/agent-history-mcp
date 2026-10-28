@@ -159,6 +159,8 @@ _MULTIPLEX_COMMANDS = {
     "deno", "docker", "docker-compose", "dotnet", "flutter", "gcloud", "gh", "git",
     "go", "gradle", "helm", "kubectl", "make", "mvn", "npm", "npx", "pip", "pip3",
     "pnpm", "poetry", "rails", "rake", "systemctl", "terraform", "uv", "uvx", "yarn",
+    "aws", "firebase", "fly", "flyctl", "heroku", "prisma", "alembic", "supabase", "twine",
+    "vercel", "wrangler", "nx", "turbo", "bazel", "pulumi", "skaffold", "minikube", "kind",
 }
 _SHELL_WRAPPERS = {"bash", "sh", "zsh", "pwsh", "powershell", "powershell.exe", "cmd", "cmd.exe"}
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")

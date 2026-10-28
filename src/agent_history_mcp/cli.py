@@ -105,6 +105,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days-back", type=int, default=30)
     p.add_argument("--sources", default="all")
 
+    p = sub.add_parser("skills", help="suggest, draft, install and check skills")
+    skills_sub = p.add_subparsers(dest="skills_cmd")
+    s = skills_sub.add_parser("suggest")
+    s.add_argument("--sources", default="all")
+    s.add_argument("-n", "--max-candidates", type=int, default=5)
+    s.add_argument("--min-sessions", type=int, default=2)
+    s.add_argument("--days-back", type=int)
+    s.add_argument("--project")
+    s = skills_sub.add_parser("draft")
+    s.add_argument("candidate_id")
+    s = skills_sub.add_parser("install")
+    s.add_argument("--file", help="reviewed SKILL.md to install")
+    s.add_argument("--candidate-id")
+    s.add_argument("--target", action="append", dest="targets")
+    s.add_argument("--scope", default="user", choices=["user", "project"])
+    s.add_argument("--project")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--overwrite", action="store_true")
+    s = skills_sub.add_parser("health")
+    s.add_argument("--days-back", type=int, default=60)
+    s.add_argument("--project")
+
     p = sub.add_parser("hook", help="agent hook entry points")
     hook_sub = p.add_subparsers(dest="hook")
     h = hook_sub.add_parser("session-start", help="Claude Code SessionStart hook: inject other agents' recent context")
@@ -150,6 +172,19 @@ def main(argv: list[str] | None = None) -> int:
         out = server.analyze_sessions(args.project, args.days_back or None, _sources(args.sources), args.group_by)
     elif command == "report":
         out = server.history_report(args.project, args.days_back or None, _sources(args.sources))
+    elif command == "skills":
+        if args.skills_cmd == "suggest":
+            out = server.suggest_skills(_sources(args.sources), args.max_candidates, args.min_sessions, args.days_back, True, args.project)
+        elif args.skills_cmd == "draft":
+            out = server.draft_skill(args.candidate_id)
+        elif args.skills_cmd == "install":
+            text = open(args.file, encoding="utf-8").read() if args.file else None
+            out = server.install_skill(text, args.candidate_id, args.targets, args.scope, args.project, args.apply, args.overwrite)
+        elif args.skills_cmd == "health":
+            out = server.skill_health(args.days_back or None, args.project)
+        else:
+            parser.parse_args(["skills", "--help"])
+            return 2
     else:
         parser.print_help()
         return 2

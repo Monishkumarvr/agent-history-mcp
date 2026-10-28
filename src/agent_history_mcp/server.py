@@ -14,7 +14,7 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import analytics, handoff, memory_sync
+from . import analytics, handoff, memory_sync, skill_store, skills
 from .model import agent_home
 from .graph import DEFAULT_DB_PATH, GraphHit, HistoryGraphIndex, format_graph_hits
 from .redact import redact
@@ -350,26 +350,109 @@ def suggest_skills(
     max_candidates: int = 5,
     min_sessions: int = 2,
     days_back: int | None = None,
+    include_workflows: bool = True,
+    project: str | None = None,
 ) -> str:
     """
-    Suggest reusable skills that could be created from repeated chat patterns.
+    Suggest reusable skills from repeated work across all your agents.
 
-    Returns ranked skill ideas with trigger phrases, supporting sessions, and
-    boundaries. This never writes SKILL.md files and never calls a model.
+    Combines repeated multi-step tool workflows (the same commands/edits in the
+    same order across sessions) with recurring topic clusters, then checks each
+    against your installed skills: create, update <existing>, or skip.
+    Returns ranked ideas with steps, triggers and evidence sessions. Never
+    writes files or calls a model; use draft_skill next.
     """
     valid = resolve_sources(sources)
     if not valid:
         return f"Invalid sources. Use {SOURCES_HELP}."
 
     _refresh_history_index()
+    root = handoff.resolve_project(project) if project else None
     candidates = suggest_skill_candidates(
         _get_graph_index(),
         sources=valid,
         max_candidates=max_candidates,
         min_sessions=min_sessions,
         days_back=days_back,
+        include_workflows=include_workflows,
+        project=root,
+        installed=skill_store.discover_installed_skills(handoff.resolve_project(project)),
     )
     return format_skill_candidates(candidates)
+
+
+@mcp.tool()
+@_redacted
+def draft_skill(candidate_id: str, sources: list[str] | str = "all") -> str:
+    """
+    Draft an Agent Skills SKILL.md (works in Claude Code, Codex, Gemini CLI,
+    Cursor, OpenCode...) for a candidate from suggest_skills.
+
+    The draft is deterministic: frontmatter (name, description with triggers),
+    steps with real example commands, known failure modes and their fixes,
+    verification, and evidence. Review and edit it, then pass it to
+    install_skill. Use get_session on the evidence sessions to refine it.
+    """
+    valid = resolve_sources(sources)
+    _refresh_history_index()
+    candidate = skills.find_candidate(_get_graph_index(), candidate_id, valid or None)
+    if candidate is None:
+        return f"Unknown candidate '{candidate_id}'. Run suggest_skills first and use one of its IDs."
+    note = ""
+    if candidate.action in ("skip", "update") and candidate.overlap_with:
+        note = f"Note: {candidate.overlap_reason} (`{candidate.overlap_with}`).\n\n"
+    return f"{note}{skills.draft_skill_md(candidate)}"
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
+@_redacted
+def install_skill(
+    skill_md: str | None = None,
+    candidate_id: str | None = None,
+    targets: list[str] | None = None,
+    scope: str = "user",
+    project: str | None = None,
+    apply: bool = False,
+    overwrite: bool = False,
+) -> str:
+    """
+    Install a SKILL.md for several agents at once (dry run unless apply=true).
+
+    skill_md: the reviewed SKILL.md text (or pass candidate_id to install the
+    unedited draft). targets: "claude" (~/.claude/skills) and/or "agents"
+    (~/.agents/skills, read by Codex and other Agent Skills clients), or
+    "codex" (~/.codex/skills, older Codex). scope: "user" or "project".
+    Existing skills are never replaced unless overwrite=true.
+    """
+    _refresh_history_index()
+    index = _get_graph_index()
+    steps = None
+    if candidate_id:
+        candidate = skills.find_candidate(index, candidate_id)
+        if candidate is None:
+            return f"Unknown candidate '{candidate_id}'. Run suggest_skills first."
+        skill_md = skill_md or skills.draft_skill_md(candidate)
+        steps = candidate.steps or None
+    if not skill_md:
+        return "Pass skill_md (the SKILL.md text) or candidate_id."
+    root = handoff.resolve_project(project) if (project or scope == "project") else None
+    return skill_store.install_skill(index, skill_md, targets, scope, root, apply, overwrite, candidate_id, steps)
+
+
+@mcp.tool()
+@_redacted
+def skill_health(days_back: int | None = 60, project: str | None = None) -> str:
+    """
+    Check how your installed skills are actually used across agents: invocations
+    per agent, last use, missed triggers (matching work where the skill never
+    fired, meaning its description needs work), outcome proxies, references to
+    commands that no longer appear, and a keep / revise / update / retire call.
+    """
+    _refresh_history_index()
+    root = handoff.resolve_project(project) if project else None
+    installed = skill_store.discover_installed_skills(root)
+    report = skills.skill_health(_get_graph_index(), installed, days_back, root)
+    return skills.format_skill_health(report, days_back)
 
 
 # Context bridge
@@ -503,10 +586,21 @@ def analyze_sessions(
 
 def _report_sections(valid: list[str], root: str | None, days_back: int | None) -> list[tuple[str, list[tuple[str, str]]]]:
     index = _get_graph_index()
-    skills = suggest_skill_candidates(index, sources=valid, max_candidates=5, min_sessions=2, days_back=days_back)
+    candidates = suggest_skill_candidates(
+        index, sources=valid, max_candidates=6, min_sessions=2, days_back=days_back,
+        include_workflows=True, project=root, installed=skill_store.discover_installed_skills(root),
+    )
     rules = memory_sync.suggest_rules(index, root, valid, days_back, 2)
+    health = skills.skill_health(index, skill_store.discover_installed_skills(root), days_back, root)
     return [
-        ("Skill candidates", [(c.name, c.why) for c in skills]),
+        ("Skill candidates", [
+            (f"{c.name} ({c.action})", (" -> ".join(c.steps) + " · " if c.steps else "") + c.why + f" · id {c.candidate_id}")
+            for c in candidates
+        ]),
+        ("Installed skill health", [
+            (f"{h.name}: {h.recommendation}", f"used {sum(h.by_source.values())}× · {len(h.missed)} missed trigger(s) · {h.outcome}")
+            for h in health[:10]
+        ]),
         ("Rule candidates from your corrections", [
             (r.rule, f"{r.kind} · {len(r.sessions)} sessions" + (f" · already in {', '.join(r.documented_in)}" if r.documented_in else ""))
             for r in rules[:8]
@@ -539,6 +633,41 @@ def history_report(
     path = out_dir / f"report-{date.today().isoformat()}.html"
     path.write_text(redact(page), encoding="utf-8")
     return f"Report written to {path} ({len(result.sessions)} sessions, {result.scope}). Open it in a browser."
+
+
+# Prompts (surface as slash commands in clients that support MCP prompts)
+
+@mcp.prompt(name="handoff", description="Continue work from where the last agent stopped in this repository")
+def handoff_prompt(project: str = "") -> str:
+    target = f'project="{project}"' if project else "the current repository"
+    return (
+        f"Call the agent-history handoff_brief tool for {target}. Read the brief, then: "
+        "1) restate the goal and where the previous session stopped in two sentences, "
+        "2) avoid the listed dead ends, 3) verify the repository state matches the brief, "
+        "and 4) continue with the suggested next step, asking me first if the goal is unclear."
+    )
+
+
+@mcp.prompt(name="draft-skill", description="Turn a repeated workflow from your history into a reviewed SKILL.md")
+def draft_skill_prompt(candidate_id: str = "") -> str:
+    pick = f"candidate {candidate_id}" if candidate_id else "the best candidate whose action is create or update"
+    return (
+        "Use the agent-history tools to turn my repeated work into a skill. "
+        f"Run suggest_skills, pick {pick}, and call draft_skill. Open one or two evidence sessions with "
+        "get_session(include_tools=true) to check the steps. Improve the draft: precise description with "
+        "trigger phrases, generic placeholders instead of project values, and real failure modes. Show me the "
+        "final SKILL.md, then call install_skill with apply=false so I can review where it will be written."
+    )
+
+
+@mcp.prompt(name="weekly-review", description="Review the last week of agent sessions: friction, skills, rules")
+def weekly_review_prompt(days: str = "7") -> str:
+    return (
+        f"Using the agent-history tools for the last {days} days: run analyze_sessions, suggest_skills, "
+        "suggest_rules and skill_health, then history_report. Summarize for me in under 15 lines: where time "
+        "went, the top friction patterns, up to three skills worth creating or fixing, and up to three rules "
+        "worth adding to every agent's instructions (via sync_memory). Include the report path."
+    )
 
 
 def run() -> None:

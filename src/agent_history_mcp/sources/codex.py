@@ -75,18 +75,22 @@ def _date_from_path(path: Path) -> str:
         return ""
 
 
-def _exit_code_from_output(text: str) -> int | None:
+def _unwrap_output(text: str) -> tuple[str, int | None]:
+    """Tool outputs are often JSON {"output": ..., "metadata": {"exit_code": n}}."""
     try:
         data = json.loads(text)
     except (ValueError, TypeError):
-        return None
-    if isinstance(data, dict):
-        meta = data.get("metadata")
-        if isinstance(meta, dict) and isinstance(meta.get("exit_code"), int):
-            return meta["exit_code"]
-        if isinstance(data.get("exit_code"), int):
-            return data["exit_code"]
-    return None
+        return text, None
+    if not isinstance(data, dict):
+        return text, None
+    exit_code = None
+    meta = data.get("metadata")
+    if isinstance(meta, dict) and isinstance(meta.get("exit_code"), int):
+        exit_code = meta["exit_code"]
+    elif isinstance(data.get("exit_code"), int):
+        exit_code = data["exit_code"]
+    output = data.get("output")
+    return (output if isinstance(output, str) else text), exit_code
 
 
 def parse_codex_session_file(path: Path, title_index: dict[str, str] | None = None) -> dict | None:
@@ -160,8 +164,7 @@ def parse_codex_session_file(path: Path, title_index: dict[str, str] | None = No
             builder.add_tool_call("web_search_call", payload.get("action") or {}, ts)
         elif item_type in ("function_call_output", "custom_tool_call_output"):
             call_id = payload.get("call_id") or ""
-            text = output_text(payload.get("output"))
-            exit_code = _exit_code_from_output(text)
+            text, exit_code = _unwrap_output(output_text(payload.get("output")))
             if exit_code is None:
                 exit_code = exit_codes.get(call_id)
             builder.add_tool_result(call_id, text, ts, exit_code=exit_code, name=payload.get("name") or "")

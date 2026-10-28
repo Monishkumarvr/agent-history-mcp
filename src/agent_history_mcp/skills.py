@@ -1,19 +1,25 @@
 """
-Suggest reusable Codex/Claude skills from the local chat graph.
+Suggest, draft, and track reusable skills from the local chat graph.
 
-The suggestions are deterministic and evidence-backed. They do not write skill
-files and they do not call a model.
+Candidates come from two deterministic signals: recurring topic clusters in
+the graph, and repeated multi-step tool workflows (workflows.py). Each one is
+checked against already-installed skills (create / update / skip), can be
+drafted as an Agent Skills SKILL.md, and installed skills are scored for
+usage, missed triggers and drift. Nothing here calls a model or writes files.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from .graph import HistoryGraphIndex
+from .sources import SOURCE_NAMES
 
 
 @dataclass
@@ -36,6 +42,14 @@ class SkillCandidate:
     confidence: float
     why: str
     boundaries: str
+    kind: str = "topic"                      # topic | workflow
+    steps: list[str] = field(default_factory=list)
+    scope: str = ""
+    examples: dict[int, list[str]] = field(default_factory=dict)
+    failures: list[tuple[str, str, str]] = field(default_factory=list)
+    action: str = "create"                   # create | update | skip
+    overlap_with: str = ""
+    overlap_reason: str = ""
 
 
 _GENERIC_TERMS = {
@@ -79,8 +93,53 @@ def suggest_skill_candidates(
     max_candidates: int = 5,
     min_sessions: int = 2,
     days_back: int | None = None,
+    include_workflows: bool = False,
+    project: str | None = None,
+    installed: list | None = None,
 ) -> list[SkillCandidate]:
-    source_set = sorted({s for s in (sources or ["codex", "claude"]) if s in ("codex", "claude")})
+    candidates = _topic_candidates(index, sources, max_candidates, min_sessions, days_back)
+    if include_workflows:
+        workflows = workflow_candidates(index, sources, min_sessions, days_back, project, limit=max_candidates)
+        candidates = [c for c in candidates if not _covered_by_workflow(c, workflows)]
+        merged = {c.candidate_id: c for c in [*workflows, *candidates]}
+        candidates = sorted(merged.values(), key=lambda c: (-c.confidence, c.kind != "workflow", c.slug))
+    unique_slugs: dict[str, SkillCandidate] = {}
+    for candidate in candidates:
+        unique_slugs.setdefault(candidate.slug, candidate)
+    candidates = list(unique_slugs.values())
+    if installed is not None:
+        annotate_overlap(candidates, installed)
+        candidates.sort(key=lambda c: (c.action == "skip", -c.confidence))
+    candidates = candidates[:max_candidates]
+    _LAST_CANDIDATES.update({c.candidate_id: c for c in candidates})
+    return candidates
+
+
+def _covered_by_workflow(candidate: SkillCandidate, workflows: list[SkillCandidate]) -> bool:
+    """A single-command topic is redundant when a workflow over the same sessions contains it."""
+    from .model import command_signature
+
+    commands = [t.split(":", 1)[1] for t in candidate.recurring_terms if t.startswith("command:")]
+    if not commands:
+        return False
+    sessions = {(e.source, e.session_id) for e in candidate.evidence}
+    for workflow in workflows:
+        step_sigs = {s.split(":", 1)[1] for s in workflow.steps if s.startswith("shell:")}
+        wf_sessions = {(e.source, e.session_id) for e in workflow.evidence}
+        overlap = len(sessions & wf_sessions) / len(sessions) if sessions else 0
+        if overlap >= 0.8 and all(command_signature(c) in step_sigs for c in commands):
+            return True
+    return False
+
+
+def _topic_candidates(
+    index: HistoryGraphIndex,
+    sources: list[str] | None,
+    max_candidates: int,
+    min_sessions: int,
+    days_back: int | None,
+) -> list[SkillCandidate]:
+    source_set = sorted({s for s in (sources or SOURCE_NAMES) if s in SOURCE_NAMES})
     if not source_set:
         return []
     min_sessions = max(1, min_sessions)
@@ -123,16 +182,25 @@ def format_skill_candidates(candidates: list[SkillCandidate]) -> str:
             f"{idx}. {candidate.name}",
             f"   ID: {candidate.candidate_id}",
             f"   Slug: {candidate.slug}",
+            f"   Kind: {candidate.kind}" + (f" · scope: {candidate.scope}" if candidate.scope else ""),
             f"   Confidence: {candidate.confidence:.2f}",
             f"   Description: {candidate.description}",
+        ])
+        if candidate.steps:
+            lines.append(f"   Steps: {' -> '.join(candidate.steps)}")
+        lines.extend([
             f"   When to use: {', '.join(candidate.triggers[:6])}",
             f"   Recurring terms: {', '.join(candidate.recurring_terms[:8])}",
             f"   Evidence: {len(candidate.evidence)} sessions, {len(sources)} source(s)",
             f"   Sessions: {evidence}",
             f"   Why: {candidate.why}",
             f"   Boundaries: {candidate.boundaries}",
-            "",
         ])
+        if candidate.overlap_reason:
+            lines.append(f"   Action: {candidate.action}" + (f" `{candidate.overlap_with}`" if candidate.overlap_with else "") + f" ({candidate.overlap_reason})")
+        lines.append("")
+    if any(c.action != "skip" for c in candidates):
+        lines.append("Next: draft_skill(candidate_id) builds a SKILL.md you can review and install.")
     return "\n".join(lines).rstrip()
 
 
@@ -482,3 +550,304 @@ def _boundaries(kind: str, value: str) -> str:
     if kind == "path":
         return "Keep the skill focused on workflows around this file or module area."
     return "Keep the skill narrow: include repeated workflow steps and exclude one-off project details."
+
+
+# Workflow candidates
+
+_LAST_CANDIDATES: dict[str, SkillCandidate] = {}
+
+
+def workflow_candidates(
+    index: HistoryGraphIndex,
+    sources: list[str] | None = None,
+    min_sessions: int = 2,
+    days_back: int | None = None,
+    project: str | None = None,
+    limit: int = 10,
+) -> list[SkillCandidate]:
+    from .workflows import describe_step, intent_keywords, mine_workflows
+
+    patterns = mine_workflows(index, sources, project, days_back, min_sessions=min_sessions, limit=limit)
+    candidates = []
+    for pattern in patterns:
+        keywords = intent_keywords(pattern.intents + [s["title"] for s in pattern.sessions])
+        sigs = [step.split(":", 1)[1] for step in pattern.steps if step.startswith("shell:")]
+        if keywords:
+            base = " ".join(keywords[:3])
+        else:
+            base = " ".join(dict.fromkeys(sig.split()[0] for sig in sigs)) or pattern.steps[0].split(":")[-1]
+        name = _humanize(base) + " Workflow"
+        slug = _slugify(name)
+        session_count = len(pattern.sessions)
+        source_count = len(pattern.sources)
+        confidence = min(0.95, round(
+            0.3 + min(0.35, math.log1p(session_count) / 5) + (0.1 if source_count > 1 else 0.0)
+            + (0.1 if len(pattern.projects) > 1 else 0.0) + min(0.1, 0.02 * len(pattern.steps)), 2,
+        ))
+        pretty = [describe_step(step) for step in pattern.steps]
+        triggers = [k for k in keywords] + [sig for sig in sigs if sig not in keywords]
+        candidates.append(SkillCandidate(
+            candidate_id=pattern.candidate_id,
+            name=name,
+            slug=slug,
+            description=f"Repeatable workflow: {', then '.join(pretty)}.",
+            triggers=triggers[:8] or [slug.replace('-', ' ')],
+            recurring_terms=[f"step:{s}" for s in pattern.steps],
+            evidence=[SkillEvidence(s["session_id"], s["title"], s["date"], s["source"]) for s in pattern.sessions[:8]],
+            confidence=confidence,
+            why=(
+                f"The same {len(pattern.steps)}-step tool sequence ran in {session_count} sessions "
+                f"across {source_count} agent(s) and {max(1, len(pattern.projects))} project(s)."
+            ),
+            boundaries="Keep the skill to this sequence and its known failure modes; leave project-specific values as parameters.",
+            kind="workflow",
+            steps=list(pattern.steps),
+            scope=pattern.scope,
+            examples={i: [cmd for cmd, _n in counter.most_common(2)] for i, counter in pattern.examples.items()},
+            failures=list(pattern.failures),
+        ))
+    return candidates
+
+
+# Overlap with installed skills
+
+_WORD_RE = re.compile(r"[a-z][a-z0-9+#-]{2,}")
+
+
+def _key_terms(candidate: SkillCandidate) -> set[str]:
+    words: set[str] = set()
+    for text in [candidate.name, *candidate.triggers[:6], *candidate.steps, *candidate.recurring_terms[:6]]:
+        for word in _WORD_RE.findall(text.lower().replace(":", " ")):
+            if word not in _GENERIC_TERMS and word not in ("workflow", "troubleshooting", "integration", "shell", "edit", "step"):
+                words.add(word)
+    return words
+
+
+def annotate_overlap(candidates: list[SkillCandidate], installed: list) -> None:
+    try:
+        from rapidfuzz.fuzz import token_set_ratio
+    except ImportError:  # pragma: no cover
+        token_set_ratio = lambda a, b: 100.0 if a == b else 0.0  # noqa: E731
+
+    for candidate in candidates:
+        terms = _key_terms(candidate)
+        best = (0.0, None, "")
+        for skill in installed:
+            name_score = token_set_ratio(candidate.slug.replace("-", " "), skill.name.replace("-", " "))
+            haystack = set(_WORD_RE.findall(f"{skill.name} {skill.description} {skill.body[:4000]}".lower()))
+            coverage = (len(terms & haystack) / len(terms) * 100) if terms else 0.0
+            score = max(name_score if name_score >= 85 else 0.0, coverage)
+            if score > best[0]:
+                reason = "same name" if name_score >= 85 and name_score >= coverage else f"{coverage:.0f}% of its key terms already covered"
+                best = (score, skill, reason)
+        score, skill, reason = best
+        if skill is None or score < 50:
+            candidate.action, candidate.overlap_with = "create", ""
+            candidate.overlap_reason = "no installed skill covers this"
+        elif score >= 80:
+            candidate.action, candidate.overlap_with = "skip", skill.name
+            candidate.overlap_reason = f"already covered by installed skill ({reason})"
+        else:
+            candidate.action, candidate.overlap_with = "update", skill.name
+            candidate.overlap_reason = f"partly covered ({reason}); extend that skill instead of adding a new one"
+
+
+def find_candidate(index: HistoryGraphIndex, candidate_id: str, sources: list[str] | None = None) -> SkillCandidate | None:
+    if candidate_id in _LAST_CANDIDATES:
+        return _LAST_CANDIDATES[candidate_id]
+    for min_sessions in (2, 1):
+        for candidate in suggest_skill_candidates(index, sources, max_candidates=100, min_sessions=min_sessions, include_workflows=True):
+            if candidate.candidate_id == candidate_id or candidate.slug == candidate_id:
+                return candidate
+    return None
+
+
+# Drafting
+
+def draft_skill_md(candidate: SkillCandidate) -> str:
+    from .workflows import describe_step
+
+    slug = candidate.slug[:64].strip("-") or "chat-derived-skill"
+    agents = sorted({e.source for e in candidate.evidence})
+    when = ", ".join(candidate.triggers[:5])
+    description = f"{candidate.description.rstrip('.')}. Use when working on {when}." if when else candidate.description
+    description = description.replace("\n", " ")[:1000]
+
+    lines = ["---", f"name: {slug}", f"description: {description}", "---", "", f"# {candidate.name}", ""]
+    lines.append(f"{candidate.description}")
+    lines.extend(["", "## When to use", ""])
+    lines.extend(f"- {t}" for t in candidate.triggers[:6])
+
+    lines.extend(["", "## Steps", ""])
+    if candidate.steps:
+        for i, step in enumerate(candidate.steps):
+            examples = candidate.examples.get(i, [])
+            example = f" — e.g. `{examples[0]}`" if examples else ""
+            lines.append(f"{i + 1}. {describe_step(step)[:1].upper() + describe_step(step)[1:]}{example}")
+    else:
+        commands = [t.split(":", 1)[1] for t in candidate.recurring_terms if t.startswith("command:")]
+        apis = [t.split(":", 1)[1] for t in candidate.recurring_terms if t.startswith(("api:", "path:"))]
+        lines.append("1. Confirm the goal and gather the current state (logs, config, failing output).")
+        if commands:
+            lines.append("2. Use the commands that worked before: " + ", ".join(f"`{c}`" for c in commands[:4]) + ".")
+        if apis:
+            lines.append(f"{3 if commands else 2}. Check the usual touch points: " + ", ".join(f"`{a}`" for a in apis[:4]) + ".")
+        lines.append(f"{2 + bool(commands) + bool(apis)}. Apply the fix, then re-run the failing check to verify.")
+
+    failures = list(candidate.failures)
+    errors = [t.split(":", 1)[1] for t in candidate.recurring_terms if t.startswith("error:")]
+    if failures or errors:
+        lines.extend(["", "## Known failure modes", ""])
+        for sig, error, fix in failures[:5]:
+            lines.append(f"- `{sig}` failed with \"{error}\"" + (f"; it later succeeded as `{fix}`" if fix else ""))
+        for error in errors[:3]:
+            lines.append(f"- {error}")
+
+    verify = next((ex[0] for i, ex in sorted(candidate.examples.items(), reverse=True)
+                   if ex and i < len(candidate.steps) and candidate.steps[i].startswith("shell:")), "")
+    lines.extend(["", "## Verify", "", f"- Re-run `{verify}` and confirm it succeeds." if verify else "- Re-run the check that originally failed and confirm it passes."])
+    lines.extend(["", "## Boundaries", "", f"- {candidate.boundaries}"])
+    lines.extend([
+        "", "## Evidence", "",
+        f"Derived by agent-history-mcp from {len(candidate.evidence)} session(s) in {', '.join(agents)}:",
+    ])
+    lines.extend(f"- {e.source} {e.session_date or ''}: {e.session_title[:80]}" for e in candidate.evidence[:5])
+    lines.extend(["", "Review and edit before installing; remove project-specific values."])
+    return "\n".join(lines) + "\n"
+
+
+# Skill health
+
+@dataclass
+class SkillHealth:
+    name: str
+    path: str
+    agents: list[str]
+    uses: list[dict]
+    by_source: Counter
+    last_used: str
+    missed: list[dict]
+    stale_commands: list[str]
+    outcome: str
+    recommendation: str
+
+
+def _sessions_matching_steps(index: HistoryGraphIndex, steps: list[str], days_back: int | None) -> list[dict]:
+    from .workflows import load_sequences
+
+    target = tuple(steps)
+    n = len(target)
+    matches = []
+    for seq in load_sequences(index, None, None, days_back).values():
+        if any(tuple(seq.tokens[i:i + n]) == target for i in range(len(seq.tokens) - n + 1)):
+            matches.append({"session_key": seq.row["session_key"], "source": seq.row["source"],
+                            "session_id": seq.row["session_id"], "date": seq.row["session_date"]})
+    return matches
+
+
+def _sessions_matching_name(index: HistoryGraphIndex, name: str, days_back: int | None) -> list[dict]:
+    words = [w for w in re.split(r"[-_\s]+", name.lower()) if len(w) >= 3 and w not in _GENERIC_TERMS and w not in ("skill", "workflow", "helper")]
+    if not words or (len(words) == 1 and len(words[0]) < 5):
+        return []
+    date_filter, params = _date_filter(days_back)
+    likes = " AND ".join("LOWER(e.text) LIKE ?" for _ in words)
+    rows = index.conn.execute(
+        f"""
+        SELECT DISTINCT s.session_key, s.source, s.session_id, s.session_date AS date
+        FROM events e JOIN sessions s ON s.session_key = e.session_key
+        WHERE e.kind = 'user' AND {likes} {date_filter}
+        """,
+        (*[f"%{w}%" for w in words], *params),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _error_rate(index: HistoryGraphIndex, session_keys: list[str]) -> float | None:
+    if not session_keys:
+        return None
+    row = index.conn.execute(
+        f"SELECT SUM(n_errors) AS e, SUM(n_tool_calls) AS t FROM sessions WHERE session_key IN ({','.join('?' for _ in session_keys)})",
+        session_keys,
+    ).fetchone()
+    return (row["e"] or 0) / row["t"] if row and row["t"] else None
+
+
+def skill_health(
+    index: HistoryGraphIndex,
+    installed: list,
+    days_back: int | None = 60,
+    project: str | None = None,
+) -> list[SkillHealth]:
+    from .graph import extract_graph_terms
+    from .model import command_signature
+    from .skill_store import installed_records, skill_invocations
+
+    usage = skill_invocations(index, days_back, project)
+    records = installed_records(index)
+    date_filter, params = _date_filter(days_back)
+    seen_sigs = {
+        row["cmd_sig"] for row in index.conn.execute(
+            f"SELECT DISTINCT e.cmd_sig FROM events e JOIN sessions s ON s.session_key = e.session_key "
+            f"WHERE e.cmd_sig != '' {date_filter}", params,
+        ).fetchall()
+    }
+    report: list[SkillHealth] = []
+    for skill in installed:
+        uses = usage.get(skill.name.lower(), [])
+        used_keys = {u["session_key"] for u in uses}
+        record = records.get(skill.name)
+        steps = json.loads(record["steps"]) if record and record.get("steps") else None
+        candidates = _sessions_matching_steps(index, steps, days_back) if steps else _sessions_matching_name(index, skill.name, days_back)
+        missed = [m for m in candidates if m["session_key"] not in used_keys]
+
+        referenced = {
+            command_signature(term.value) for term in extract_graph_terms(skill.body, max_terms=60) if term.kind == "command"
+        }
+        stale = sorted(sig for sig in referenced if sig and sig not in seen_sigs) if seen_sigs else []
+
+        used_rate = _error_rate(index, list(used_keys))
+        missed_rate = _error_rate(index, [m["session_key"] for m in missed])
+        if used_rate is not None and missed_rate is not None:
+            outcome = f"error rate with skill {used_rate:.0%} vs without {missed_rate:.0%} (directional)"
+        else:
+            outcome = "not enough comparable sessions"
+
+        if not uses and missed:
+            recommendation = "revise description: matching work happened but the skill never triggered"
+        elif not uses:
+            recommendation = "consider retiring: not used and no matching work in this window"
+        elif used_rate is not None and missed_rate is not None and used_rate > missed_rate + 0.1:
+            recommendation = "update: sessions using it fail more often than similar sessions without it"
+        elif len(missed) >= len(uses):
+            recommendation = f"revise description: it fired in {len(uses)} of {len(uses) + len(missed)} matching sessions"
+        elif stale:
+            recommendation = "update: it references commands that no longer appear in your history"
+        else:
+            recommendation = "keep"
+        report.append(SkillHealth(
+            name=skill.name, path=str(skill.path), agents=skill.agents, uses=uses,
+            by_source=Counter(u["source"] for u in uses), last_used=uses[-1]["date"] if uses else "",
+            missed=missed, stale_commands=stale, outcome=outcome, recommendation=recommendation,
+        ))
+    order = {"keep": 3}
+    report.sort(key=lambda h: (order.get(h.recommendation, 0), -len(h.missed), h.name))
+    return report
+
+
+def format_skill_health(report: list[SkillHealth], days_back: int | None) -> str:
+    if not report:
+        return "No installed skills found in ~/.claude/skills, ~/.agents/skills, ~/.codex/skills or the project."
+    window = f"last {days_back} days" if days_back else "all time"
+    lines = [f"Skill health for {len(report)} installed skill(s), {window}:", ""]
+    for h in report:
+        used = ", ".join(f"{src} {n}" for src, n in h.by_source.most_common()) or "never"
+        lines.append(f"- {h.name} ({', '.join(h.agents)})")
+        lines.append(f"  used: {used}" + (f" · last {h.last_used}" if h.last_used else ""))
+        if h.missed:
+            examples = ", ".join(f"{m['source']}:{m['session_id'][:10]}" for m in h.missed[:3])
+            lines.append(f"  missed triggers: {len(h.missed)} matching session(s) without it ({examples})")
+        if h.stale_commands:
+            lines.append(f"  drift: references {', '.join(f'`{c}`' for c in h.stale_commands[:4])} not seen recently")
+        lines.append(f"  outcome: {h.outcome}")
+        lines.append(f"  -> {h.recommendation}")
+    return "\n".join(lines)
