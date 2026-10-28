@@ -20,7 +20,7 @@ class SearchHit:
     session_id:    str
     session_title: str
     session_date:  str
-    source:        str           # "codex" | "claude"
+    source:        str           # claude | codex | gemini | opencode | cursor
     matched_role:  str           # "user" | "assistant"; which message triggered the match
     question_text: str | None    # user-side message text (may be None at session boundary)
     question_ts:   str | None
@@ -302,8 +302,10 @@ def format_hits(hits: list[SearchHit], query: str) -> str:
     return "\n".join(lines)
 
 
-def format_session(session: dict, max_messages: int = 30) -> str:
-    """Format a full session as readable text."""
+def format_session(session: dict, max_messages: int = 30, events: list | None = None) -> str:
+    """Format a full session as readable text, optionally with tool events."""
+    if events is not None:
+        return _format_session_events(session, events, max_messages)
     msgs = session["messages"][:max_messages]
     truncated = len(session["messages"]) > max_messages
 
@@ -322,4 +324,48 @@ def format_session(session: dict, max_messages: int = 30) -> str:
         lines.append(f"\n[{role_label}] {msg['ts']}")
         lines.append(msg["text"][:2000])
 
+    return "\n".join(lines)
+
+
+def _format_session_events(session: dict, events: list, max_messages: int) -> str:
+    """Interleave messages with tool calls/results (message text is a preview)."""
+    lines = [
+        f"Source : {session['source'].upper()}",
+        f"Session: {session.get('session_title') or session.get('title', '')}",
+        f"Date   : {session['session_date']}",
+        f"ID     : {session['session_id'][:36]}",
+    ]
+    if session.get("project"):
+        lines.append(f"Project: {session['project']}" + (f" (branch {session['git_branch']})" if session.get("git_branch") else ""))
+    lines.append("-" * 60)
+
+    shown_messages = 0
+    shown_tools = 0
+    truncated = False
+    for event in events:
+        if event.kind in ("user", "assistant"):
+            if shown_messages >= max_messages:
+                truncated = True
+                break
+            shown_messages += 1
+            label = "YOU  " if event.kind == "user" else "AGENT"
+            lines.append(f"\n[{label}] {event.ts[:16].replace('T', ' ')}")
+            lines.append(event.text)
+        elif event.kind == "tool_call":
+            if shown_tools >= max_messages * 4:
+                truncated = True
+                break
+            shown_tools += 1
+            side = " (subagent)" if event.meta.get("sidechain") else ""
+            lines.append(f"  > {event.canon_tool or event.tool}{side}: {event.text[:200]}")
+        elif event.kind == "tool_result" and (event.is_error or event.canon_tool == "shell"):
+            status = "ERROR" if event.is_error else "ok"
+            code = f" exit {event.exit_code}" if event.exit_code not in (None, 0) else ""
+            first = event.text.strip().splitlines()[0][:160] if event.text.strip() else ""
+            lines.append(f"    < {status}{code} {first}")
+        elif event.kind == "system" and event.meta.get("signal"):
+            lines.append(f"  ! {event.meta['signal']}")
+    if truncated:
+        lines.append("\n... truncated (raise max_messages to see more)")
+    lines.append("\n(Message text is a preview here; call without include_tools for full messages.)")
     return "\n".join(lines)

@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-history-mcp"
-version = "0.3.0"
-description = "Local MCP memory search for Codex CLI and Claude Code conversation history"
+version = "0.4.0"
+description = "Local cross-agent memory, handoff, analytics and skill mining for Claude Code, Codex, Gemini CLI, OpenCode and Cursor"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Monish" }]
-keywords = ["mcp", "openai", "codex", "claude", "history", "search", "memory", "terminal"]
+keywords = ["mcp", "codex", "claude-code", "gemini-cli", "opencode", "cursor", "agent-skills", "history", "memory", "handoff"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -17,15 +17,17 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0",
+    "mcp[cli]>=1.9",
     "rapidfuzz>=3.0",
 ]
 
 [project.scripts]
-agent-history-mcp = "agent_history_mcp.server:mcp.run"
+agent-history-mcp = "agent_history_mcp.server:run"
+agent-history = "agent_history_mcp.cli:main"
 
 [project.urls]
 Homepage   = "https://github.com/Monishkumarvr/agent-history-mcp"
