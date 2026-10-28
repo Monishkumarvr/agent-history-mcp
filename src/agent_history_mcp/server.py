@@ -14,7 +14,8 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import handoff, memory_sync
+from . import analytics, handoff, memory_sync
+from .model import agent_home
 from .graph import DEFAULT_DB_PATH, GraphHit, HistoryGraphIndex, format_graph_hits
 from .redact import redact
 from .search import SearchHit, build_fts_index, format_hits, format_session, search_smart
@@ -470,6 +471,74 @@ def sync_memory(
     <!-- agent-history:begin/end --> block.
     """
     return memory_sync.sync_memory(handoff.resolve_project(project), rules, targets, scope, apply)
+
+
+# Analytics
+
+@mcp.tool()
+@_redacted
+def analyze_sessions(
+    project: str | None = None,
+    days_back: int | None = 30,
+    sources: list[str] | str = "all",
+    group_by: str = "project",
+) -> str:
+    """
+    Analyze your coding-agent sessions: active time, tokens, tool mix, top and
+    failing commands, most edited files, friction (retry loops, corrections,
+    interrupts, rejected tool calls, compactions) and a directional comparison
+    of agents on shared topics.
+
+    project: limit to one repository (omit for all projects).
+    group_by: project | source | day | model.
+    """
+    valid = resolve_sources(sources)
+    if not valid:
+        return f"Invalid sources. Use {SOURCES_HELP}."
+    _refresh_history_index()
+    root = handoff.resolve_project(project) if project else None
+    result = analytics.analyze(_get_graph_index(), valid, root, days_back)
+    return analytics.format_analysis(result, group_by)
+
+
+def _report_sections(valid: list[str], root: str | None, days_back: int | None) -> list[tuple[str, list[tuple[str, str]]]]:
+    index = _get_graph_index()
+    skills = suggest_skill_candidates(index, sources=valid, max_candidates=5, min_sessions=2, days_back=days_back)
+    rules = memory_sync.suggest_rules(index, root, valid, days_back, 2)
+    return [
+        ("Skill candidates", [(c.name, c.why) for c in skills]),
+        ("Rule candidates from your corrections", [
+            (r.rule, f"{r.kind} · {len(r.sessions)} sessions" + (f" · already in {', '.join(r.documented_in)}" if r.documented_in else ""))
+            for r in rules[:8]
+        ]),
+    ]
+
+
+@mcp.tool()
+@_redacted
+def history_report(
+    project: str | None = None,
+    days_back: int | None = 30,
+    sources: list[str] | str = "all",
+) -> str:
+    """
+    Write a self-contained HTML report (analytics, friction, cross-agent
+    comparison, skill and rule candidates) to ~/.agent-history-mcp/reports and
+    return its path. Local only; no model calls.
+    """
+    valid = resolve_sources(sources)
+    if not valid:
+        return f"Invalid sources. Use {SOURCES_HELP}."
+    _refresh_history_index()
+    root = handoff.resolve_project(project) if project else None
+    result = analytics.analyze(_get_graph_index(), valid, root, days_back)
+    page = analytics.render_html(result, _report_sections(valid, root, days_back))
+    out_dir = agent_home() / "reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    from datetime import date
+    path = out_dir / f"report-{date.today().isoformat()}.html"
+    path.write_text(redact(page), encoding="utf-8")
+    return f"Report written to {path} ({len(result.sessions)} sessions, {result.scope}). Open it in a browser."
 
 
 def run() -> None:

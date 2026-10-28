@@ -94,6 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", default="project", choices=["project", "user"])
     p.add_argument("--apply", action="store_true")
 
+    p = sub.add_parser("analyze", help="session analytics")
+    p.add_argument("--project")
+    p.add_argument("--days-back", type=int, default=30)
+    p.add_argument("--sources", default="all")
+    p.add_argument("--group-by", default="project", choices=["project", "source", "day", "model"])
+
+    p = sub.add_parser("report", help="write the HTML history report")
+    p.add_argument("--project")
+    p.add_argument("--days-back", type=int, default=30)
+    p.add_argument("--sources", default="all")
+
     p = sub.add_parser("hook", help="agent hook entry points")
     hook_sub = p.add_subparsers(dest="hook")
     h = hook_sub.add_parser("session-start", help="Claude Code SessionStart hook: inject other agents' recent context")
@@ -135,6 +146,10 @@ def main(argv: list[str] | None = None) -> int:
         out = server.suggest_rules("" if args.all_projects else args.project, "all", args.days_back, args.min_sessions)
     elif command == "sync-memory":
         out = server.sync_memory(args.rules, args.targets, args.project, args.scope, args.apply)
+    elif command == "analyze":
+        out = server.analyze_sessions(args.project, args.days_back or None, _sources(args.sources), args.group_by)
+    elif command == "report":
+        out = server.history_report(args.project, args.days_back or None, _sources(args.sources))
     else:
         parser.print_help()
         return 2
