@@ -25,7 +25,7 @@ from .sources.codex import CodexAdapter
 
 
 DEFAULT_DB_PATH = agent_home() / "history_graph.sqlite"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Graph size knobs. Co-occurrence links grow with the square of the term count
 # per Q&A pair, and related_to with the square of each term's session count.
@@ -331,6 +331,21 @@ class HistoryGraphIndex:
                 PRIMARY KEY(session_key, idx)
             );
 
+            CREATE TABLE IF NOT EXISTS api_calls (
+                session_key TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                ts TEXT,
+                model TEXT,
+                sidechain INTEGER NOT NULL DEFAULT 0,
+                input INTEGER NOT NULL DEFAULT 0,
+                cache_read INTEGER NOT NULL DEFAULT 0,
+                cache_write_5m INTEGER NOT NULL DEFAULT 0,
+                cache_write_1h INTEGER NOT NULL DEFAULT 0,
+                output INTEGER NOT NULL DEFAULT 0,
+                reasoning INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(session_key, idx)
+            );
+
             CREATE TABLE IF NOT EXISTS installed_skills (
                 name TEXT NOT NULL,
                 path TEXT PRIMARY KEY,
@@ -420,6 +435,10 @@ class HistoryGraphIndex:
             params.extend(kinds)
         sql += " ORDER BY idx"
         return [event_from_row(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def calls_for(self, session_key: str) -> list[sqlite3.Row]:
+        """Per-API-call token usage, in time order."""
+        return self.conn.execute("SELECT * FROM api_calls WHERE session_key = ? ORDER BY idx", (session_key,)).fetchall()
 
     def load_sessions(self, sources: list[str] | None = None, project: str | None = None) -> list[dict]:
         """Rebuild session/message dicts from the index for keyword search (no JSONL re-parse)."""
@@ -576,6 +595,7 @@ class HistoryGraphIndex:
             self.conn.execute(f"DELETE FROM message_terms WHERE message_key IN ({placeholders})", keys)
         self.conn.execute("DELETE FROM session_terms WHERE session_key = ?", (session_key,))
         self.conn.execute("DELETE FROM events WHERE session_key = ?", (session_key,))
+        self.conn.execute("DELETE FROM api_calls WHERE session_key = ?", (session_key,))
         self.conn.execute("DELETE FROM messages WHERE session_key = ?", (session_key,))
         self.conn.execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
         self.conn.execute("DELETE FROM nodes WHERE node_key = ?", (session_key,))
@@ -622,6 +642,20 @@ class HistoryGraphIndex:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [(session_key, *event.as_row()) for event in events],
+        )
+        self.conn.executemany(
+            """
+            INSERT OR REPLACE INTO api_calls(
+                session_key, idx, ts, model, sidechain, input, cache_read,
+                cache_write_5m, cache_write_1h, output, reasoning
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (session_key, i, c["ts"], c["model"], int(c["sidechain"]), c["input"], c["cache_read"],
+                 c["cache_write_5m"], c["cache_write_1h"], c["output"], c["reasoning"])
+                for i, c in enumerate(session.get("calls") or [])
+            ],
         )
 
         session_term_weights: defaultdict[str, float] = defaultdict(float)
