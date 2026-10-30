@@ -5,6 +5,7 @@ scripts, and agent hooks.
   agent-history                       run the MCP server (stdio)
   agent-history handoff [--project .] print a cross-agent handoff brief
   agent-history hook session-start    Claude Code SessionStart hook (reads JSON on stdin)
+  agent-history hook pre-compact      PreCompact hook: checkpoint the session before compaction
   agent-history report                write the HTML history report
   agent-history --help                list every command
 """
@@ -14,19 +15,48 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 
 def _sources(value: str) -> str:
     return value or "all"
 
 
-def _session_start_hook(args: argparse.Namespace) -> int:
-    from . import handoff, server
-
+def _read_payload() -> dict:
     try:
         payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
     except ValueError:
         payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _emit_context(context: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+
+
+def _pre_compact_hook(args: argparse.Namespace) -> int:
+    from . import compaction
+
+    payload = _read_payload()
+    transcript, session_id = payload.get("transcript_path"), payload.get("session_id")
+    if not transcript or not session_id:
+        return 0
+    try:
+        compaction.write_checkpoint(Path(transcript), str(session_id), args.source, str(payload.get("trigger") or ""))
+    except Exception as exc:  # a broken checkpoint must never block compaction
+        print(f"agent-history: compaction checkpoint skipped: {exc}", file=sys.stderr)
+    return 0
+
+
+def _session_start_hook(args: argparse.Namespace) -> int:
+    from . import compaction, handoff, server
+
+    payload = _read_payload()
+    if payload.get("source") == "compact":
+        checkpoint = compaction.read_checkpoint(args.source, str(payload.get("session_id") or ""))
+        if checkpoint:
+            _emit_context(checkpoint)
+        return 0
     cwd = payload.get("cwd") or args.project
     server._refresh_history_index()
     root = handoff.resolve_project(cwd)
@@ -43,7 +73,7 @@ def _session_start_hook(args: argparse.Namespace) -> int:
         "Context from other coding agents' recent sessions in this repository "
         "(via agent-history-mcp; call handoff_brief or search_history for more):\n\n" + brief
     )
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+    _emit_context(context)
     return 0
 
 
@@ -133,6 +163,9 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--project", help="fallback when the hook payload has no cwd")
     h.add_argument("--exclude-source", default="claude", help="agent whose own sessions to skip (default: claude)")
     h.add_argument("--sessions", type=int, default=1)
+    h.add_argument("--source", default="claude", choices=["claude", "codex"], help="agent running the hook (default: claude)")
+    h = hook_sub.add_parser("pre-compact", help="PreCompact hook: save a checkpoint that session-start re-injects after compaction")
+    h.add_argument("--source", default="claude", choices=["claude", "codex"], help="agent running the hook (default: claude)")
 
     return parser
 
@@ -149,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     if command == "hook":
         if args.hook == "session-start":
             return _session_start_hook(args)
+        if args.hook == "pre-compact":
+            return _pre_compact_hook(args)
         parser.parse_args(["hook", "--help"])
         return 2
 
