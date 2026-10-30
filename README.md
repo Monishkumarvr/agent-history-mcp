@@ -68,6 +68,11 @@ Clients that support MCP prompts expose `/handoff`, `/draft-skill` and `/weekly-
 | | `sync_memory` | Previews, then with `apply=true` writes, shared rules into a managed block in CLAUDE.md / AGENTS.md / GEMINI.md. |
 | Analytics | `analyze_sessions` | Active time, tokens, tool mix, top and failing commands, edited files, friction, cross-agent comparison. |
 | | `history_report` | Writes the same as a self-contained HTML report. |
+| Scorecards | `score_sessions` | Scores each session on prompt clarity, context efficiency, rework, consistency and completion; lists the lowest and highest scorers. |
+| | `get_session_scorecard` | Explains one session's scores, findings and remedies. |
+| | `compare_sessions` | Compares two scorecards to see whether a workflow improved. |
+| | `find_friction_patterns` | Friction that recurs across sessions: repeated file reads, failing commands, correction loops, vague openers, tool-call explosions. |
+| | `suggest_instruction_updates` | Candidate CLAUDE.md / AGENTS.md rules derived from that friction, with session evidence. Read-only. |
 | Skills | `suggest_skills` | Repeated multi-step workflows plus topic clusters, checked against installed skills (create / update / skip). |
 | | `draft_skill` | Deterministic Agent Skills `SKILL.md` with real example commands, failure modes and evidence. |
 | | `install_skill` | Installs to `~/.claude/skills` and `~/.agents/skills` (or project scope). Dry run unless `apply=true`; never overwrites unless `overwrite=true`. |
@@ -175,6 +180,7 @@ The index is rebuilt automatically when its schema version changes. You can also
 - The Cursor and OpenCode formats are undocumented or change between versions. Their parsers degrade to skipping, with a note in `refresh_history_index`.
 - Extraction is deterministic, so topics can be noisy. Skill candidates and rule candidates are suggestions to review.
 - Cross-agent comparisons and skill outcome numbers are directional, not controlled experiments.
+- Session scorecards are rule-based heuristics, not a measure of final code quality.
 - The first index build over a large history can take a while. Later refreshes only parse changed units.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the landscape research and planned work.
@@ -258,6 +264,7 @@ src/agent_history_mcp/
   handoff.py       handoff briefs and checkpoints
   memory_sync.py   instruction/memory discovery, drift, rule mining, managed-block sync
   analytics.py     session analytics and HTML report
+  analysis.py      per-session scorecards and instruction suggestions
   workflows.py     workflow pattern mining
   skills.py        skill candidates, overlap, SKILL.md drafts, skill health
   skill_store.py   installed-skill discovery, usage detection, installation

@@ -23,6 +23,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from agent_history_mcp.analysis import analyze_sessions, load_sessions  # noqa: E402
 from agent_history_mcp.graph import HistoryGraphIndex  # noqa: E402
 from agent_history_mcp.parsers import parse_claude_sessions, parse_codex_sessions  # noqa: E402
 from agent_history_mcp.search import build_fts_index, search_smart  # noqa: E402
@@ -154,6 +155,10 @@ def run_benchmark(args: argparse.Namespace) -> str:
             candidates = suggest_skill_candidates(index, ["codex", "claude"], max_candidates=5, min_sessions=2)
             skill_ms = _ms(_now() - skill_start)
 
+            analysis_start = _now()
+            scorecards = analyze_sessions(load_sessions(index, ["codex", "claude"], days_back=30))
+            analysis_ms = _ms(_now() - analysis_start)
+
         finally:
             index.close()
             if conn is not None:
@@ -176,6 +181,8 @@ def run_benchmark(args: argparse.Namespace) -> str:
             cold_rebuild_count=len(cold_rebuild_times),
             skill_ms=skill_ms,
             skill_candidates=len(candidates),
+            analysis_ms=analysis_ms,
+            scorecards=len(scorecards),
             repeat=args.repeat,
             max_results=args.max_results,
         )
@@ -202,6 +209,8 @@ def _format_markdown(
     cold_rebuild_count: int,
     skill_ms: float,
     skill_candidates: int,
+    analysis_ms: float,
+    scorecards: int,
     repeat: int,
     max_results: int,
 ) -> str:
@@ -227,6 +236,7 @@ def _format_markdown(
         f"| Warm graph refresh | {graph_warm_refresh_ms:.1f} ms | Unchanged files: {warm_stats['files_unchanged']}; no JSONL reparse |",
         f"| Raw JSONL + FTS rebuild + search | {cold_rebuild_mean_ms:.1f} ms | Mean over {cold_rebuild_count} representative cold queries |",
         f"| Skill suggestion pass | {skill_ms:.1f} ms | Returned {skill_candidates} candidates |",
+        f"| Session scorecard pass | {analysis_ms:.1f} ms | Scored {scorecards} recent sessions |",
         "",
         "| Query | FTS query ms | Graph query ms | FTS hits | Graph hits | Graph-only hits |",
         "|-------|--------------|----------------|----------|------------|-----------------|",
