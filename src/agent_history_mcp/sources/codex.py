@@ -199,7 +199,7 @@ class CodexAdapter(SourceAdapter):
         units = []
         for path in iter_codex_session_files(self.root):
             try:
-                units.append(SourceUnit(str(path.resolve()), self.name, file_token(path), path))
+                units.append(SourceUnit(str(path), self.name, file_token(path), path))
             except OSError:
                 continue
         return units

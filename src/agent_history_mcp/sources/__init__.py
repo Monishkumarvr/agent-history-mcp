@@ -32,7 +32,8 @@ class SourceAdapter:
     name = ""
 
     def __init__(self, root: Path | None):
-        self.root = Path(root).expanduser() if root else None
+        # Resolved once here, so discover() can key units by str(path) without a per-file resolve().
+        self.root = Path(root).expanduser().resolve() if root else None
         self.diagnostics: list[str] = []
 
     def available(self) -> bool:

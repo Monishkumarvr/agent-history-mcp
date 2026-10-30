@@ -150,7 +150,7 @@ class GeminiAdapter(SourceAdapter):
                 if path.suffix == ".json" and path.with_suffix(".jsonl").exists():
                     continue
                 try:
-                    units.append(SourceUnit(str(path.resolve()), self.name, file_token(path), path))
+                    units.append(SourceUnit(str(path), self.name, file_token(path), path))
                 except OSError:
                     continue
         return units

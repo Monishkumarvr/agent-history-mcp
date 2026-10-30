@@ -14,7 +14,7 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import analytics, handoff, memory_sync, skill_store, skills
+from . import analysis, analytics, handoff, memory_sync, skill_store, skills
 from .model import agent_home
 from .graph import DEFAULT_DB_PATH, GraphHit, HistoryGraphIndex, format_graph_hits
 from .redact import redact
@@ -633,6 +633,125 @@ def history_report(
     path = out_dir / f"report-{date.today().isoformat()}.html"
     path.write_text(redact(page), encoding="utf-8")
     return f"Report written to {path} ({len(result.sessions)} sessions, {result.scope}). Open it in a browser."
+
+
+# Scorecards
+
+def _scorecards(sources: list[str], days_back: int | None, project: str | None = None) -> list:
+    _refresh_history_index()
+    index = _get_graph_index()
+    root = handoff.resolve_project(project) if project else None
+    sessions = analysis.load_sessions(index, sources, root, days_back)
+    cards = analysis.analyze_sessions(sessions, days_back=None, sources=sources)
+    analysis.persist_analysis(index.conn, sessions, cards)
+    return cards
+
+
+@mcp.tool()
+@_redacted
+def score_sessions(
+    project: str | None = None,
+    days_back: int | None = 30,
+    sources: list[str] | str = "all",
+    report_path: str | None = None,
+) -> str:
+    """
+    Score recent sessions on prompt clarity, context efficiency, rework,
+    consistency and completion, and list the lowest and highest scorers.
+    If report_path is given, also writes the report as local Markdown.
+    """
+    valid = resolve_sources(sources)
+    if not valid:
+        return f"Invalid sources. Use {SOURCES_HELP}."
+    cards = _scorecards(valid, days_back, project)
+    report = analysis.format_aggregate_report(cards, days_back, valid)
+    if report_path:
+        path = Path(report_path).expanduser()
+        analysis.write_markdown_report(path, "Session Scorecards", redact(report))
+        report += f"\n\nMarkdown report written to: {path}"
+    return report
+
+
+@mcp.tool()
+@_redacted
+def get_session_scorecard(session_id: str, source: str) -> str:
+    """
+    Explain one session's scorecard. session_id may be a full ID or a unique
+    prefix from list_sessions.
+    """
+    valid = resolve_sources(source)
+    if len(valid) != 1:
+        return f"source must be one of {', '.join(SOURCE_NAMES)}"
+    card = analysis.find_scorecard(_scorecards(valid, None), session_id, valid[0])
+    if not card:
+        return f"Session '{session_id}' not found in {valid[0]} history."
+    return analysis.format_scorecard(card)
+
+
+@mcp.tool()
+@_redacted
+def compare_sessions(
+    before_session_id: str,
+    after_session_id: str,
+    before_source: str = "claude",
+    after_source: str = "claude",
+) -> str:
+    """
+    Compare two session scorecards to see whether a workflow improved.
+    Session IDs may be full IDs or unique prefixes.
+    """
+    before_valid, after_valid = resolve_sources(before_source), resolve_sources(after_source)
+    if len(before_valid) != 1 or len(after_valid) != 1:
+        return f"sources must be one of {', '.join(SOURCE_NAMES)}"
+    cards = _scorecards(sorted({before_valid[0], after_valid[0]}), None)
+    before = analysis.find_scorecard(cards, before_session_id, before_valid[0])
+    after = analysis.find_scorecard(cards, after_session_id, after_valid[0])
+    if not before:
+        return f"Before session '{before_session_id}' not found in {before_valid[0]} history."
+    if not after:
+        return f"After session '{after_session_id}' not found in {after_valid[0]} history."
+    return analysis.format_comparison(before, after)
+
+
+@mcp.tool()
+@_redacted
+def find_friction_patterns(
+    project: str | None = None,
+    days_back: int | None = 30,
+    sources: list[str] | str = "all",
+    min_sessions: int = 2,
+) -> str:
+    """
+    List friction patterns that recur across sessions (repeated file reads,
+    failing commands, correction loops, vague openers, tool-call explosions).
+    """
+    valid = resolve_sources(sources)
+    if not valid:
+        return f"Invalid sources. Use {SOURCES_HELP}."
+    return analysis.format_friction_patterns(_scorecards(valid, days_back, project), min_sessions=max(1, min_sessions))
+
+
+@mcp.tool()
+@_redacted
+def suggest_instruction_updates(
+    project: str | None = None,
+    targets: list[str] = ["CLAUDE.md", "AGENTS.md"],
+    days_back: int | None = 30,
+    sources: list[str] | str = "all",
+    max_suggestions: int = 8,
+) -> str:
+    """
+    Suggest CLAUDE.md / AGENTS.md rules from friction that recurs across
+    sessions, with the sessions as evidence. Read-only: never writes files
+    (use sync_memory to apply a rule).
+    """
+    valid = resolve_sources(sources)
+    if not valid:
+        return f"Invalid sources. Use {SOURCES_HELP}."
+    cards = _scorecards(valid, days_back, project)
+    suggestions = analysis.suggest_instruction_updates(cards, targets=targets, max_suggestions=max_suggestions)
+    analysis.persist_instruction_suggestions(_get_graph_index().conn, suggestions)
+    return analysis.format_instruction_suggestions(suggestions)
 
 
 # Prompts (surface as slash commands in clients that support MCP prompts)

@@ -158,7 +158,7 @@ class ClaudeAdapter(SourceAdapter):
                     token += "|" + file_token(sub)
             except OSError:
                 continue
-            units.append(SourceUnit(str(path.resolve()), self.name, token, path))
+            units.append(SourceUnit(str(path), self.name, token, path))
         return units
 
     def parse(self, unit: SourceUnit) -> dict | None:
