@@ -6,6 +6,7 @@ Local memory, handoff, analytics and skill mining across your coding agents.
 
 - **search** what was solved before, in any agent
 - **pick up where another agent stopped** in the same repository (handoff briefs and checkpoints)
+- **survive context compaction** in Claude Code and Codex: checkpoint the session before it compacts, put the checkpoint back after, and recall the exact text the summary dropped
 - **keep instructions in sync** across CLAUDE.md, AGENTS.md, GEMINI.md and auto-memory
 - **analyze sessions** for time, tokens, failing commands and friction
 - **turn repeated workflows into skills**: mine, draft a `SKILL.md`, install it for every agent, then track whether it is actually used
@@ -21,6 +22,8 @@ Claude Code, Codex, Gemini CLI, Cursor and OpenCode all keep their own transcrip
 ```bash
 pip install git+https://github.com/monishkumarvr/agent-history-mcp.git
 ```
+
+If the `agent-history` and `agent-history-mcp` launchers don't end up on your PATH (this happens on Windows), use `python -m agent_history_mcp` in their place everywhere below, for example `python -m agent_history_mcp hook pre-compact`. Use the full path to `python.exe` in agent configs.
 
 **Claude Code** (`~/.claude/.mcp.json` or `claude mcp add agent-history -- agent-history-mcp`):
 
@@ -50,6 +53,7 @@ What did I spend this week on, and where did I struggle? -> analyze_sessions / h
 Which of my workflows should become skills?            -> suggest_skills -> draft_skill -> install_skill
 Are my skills actually being used?                     -> skill_health
 Which rules does Codex know that Claude doesn't?       -> list_agent_memory -> sync_memory
+What exactly did I ask before the last compaction?    -> session_recall
 ```
 
 Clients that support MCP prompts expose `/handoff`, `/draft-skill` and `/weekly-review` as slash commands.
@@ -96,6 +100,8 @@ agent-history skills health
 agent-history memory                         # instruction files and drift
 agent-history rules --min-sessions 2
 agent-history sync-memory                    # dry-run diff
+agent-history hook pre-compact               # PreCompact hook (--source codex for Codex)
+agent-history hook session-start             # SessionStart hook: handoff, or the checkpoint after compaction
 agent-history                                # runs the MCP server
 ```
 
@@ -188,7 +194,7 @@ Override locations with environment variables, and limit sources with `AGENT_HIS
 }
 ```
 
-Derived data (index, checkpoints, reports) lives in `~/.agent-history-mcp/` unless `AGENT_HISTORY_HOME` is set.
+Derived data (index, checkpoints, compaction checkpoints, reports) lives in `~/.agent-history-mcp/` unless `AGENT_HISTORY_HOME` is set.
 
 ## How it works
 
@@ -204,6 +210,7 @@ source adapters (claude, codex, gemini, opencode, cursor)
 - **Workflow mining** turns each session into an action skeleton: shell commands normalized to `git commit`, `npm run build` and so on, edits by file type, MCP calls and skills, with read-only noise removed. It counts contiguous step sequences shared across sessions, drops patterns that appear almost everywhere, and keeps only the longest pattern that covers a given set of sessions. Patterns seen in several projects are marked `global`.
 - **Skill overlap** compares a candidate's key terms with installed skills' names, descriptions and bodies, so you update an existing skill instead of adding a near-duplicate.
 - **Skill health** detects use through the Skill tool, `/slash-commands` and reads of `…/skills/<name>/SKILL.md`. It finds missed triggers by matching the installed workflow's steps, or the skill's name, against later sessions.
+- **Compaction checkpoints** are built from the transcript, not by a model, in about 2 s for a 100 MB session. `session_recall` reads the transcript file directly, so it also sees the session that is still running.
 - **Handoff** summarizes events. It does not summarize with a model, so a brief costs a few hundred tokens and is reproducible.
 - **Memory sync** only edits the text between `<!-- agent-history:begin -->` and `<!-- agent-history:end -->`.
 
@@ -216,7 +223,7 @@ The index is rebuilt automatically when its schema version changes. You can also
 - Every tool output passes through secret redaction: API keys, GitHub, Slack and AWS tokens, JWTs, bearer tokens, private keys, `password=` pairs and URL credentials. Set `AGENT_HISTORY_REDACT=0` to disable it.
 - Writes are opt-in. `install_skill`, `sync_memory` and `save_checkpoint(apply=true)` show a dry run or diff first and write only with `apply=true`. Project-scope writes land in your repository, so review them before committing.
 - Credentials files such as `~/.codex/auth.json` are never read.
-- The derived index contains message excerpts, so treat `~/.agent-history-mcp/` like your history directories.
+- The derived index and compaction checkpoints contain message excerpts, so treat `~/.agent-history-mcp/` like your history directories.
 
 ## Limitations
 
@@ -225,6 +232,8 @@ The index is rebuilt automatically when its schema version changes. You can also
 - Cross-agent comparisons and skill outcome numbers are directional, not controlled experiments.
 - Session scorecards are rule-based heuristics, not a measure of final code quality.
 - The first index build over a large history can take a while. Later refreshes only parse changed units.
+- `session_recall` searches full message text but only the first 500 characters of each tool output, and it re-reads the transcript on every call.
+- Compaction checkpoints need the agent's hooks: Claude Code, or Codex 0.150 and later. Gemini CLI, Cursor and OpenCode are not covered.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the landscape research and planned work.
 
