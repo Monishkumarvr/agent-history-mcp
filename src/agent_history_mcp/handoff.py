@@ -152,7 +152,7 @@ def _git_snapshot(project: str) -> list[str]:
 # Checkpoints
 
 def checkpoint_dir(project: str) -> Path:
-    digest = hashlib.sha1(project.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha1(project_root(project).encode("utf-8")).hexdigest()[:12]
     return agent_home() / "checkpoints" / digest
 
 
