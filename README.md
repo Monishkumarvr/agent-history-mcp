@@ -62,6 +62,7 @@ Clients that support MCP prompts expose `/handoff`, `/draft-skill` and `/weekly-
 | | `search_graph` | Relationship search over extracted commands, paths, APIs, errors and topics. |
 | | `list_sessions`, `get_session` | Browse sessions; `include_tools=true` interleaves commands, edits and errors. |
 | Context bridge | `handoff_brief` | Where the latest sessions in a repo stopped: goal, open todos, files touched, command outcomes, unresolved errors, dead ends, latest checkpoint, live git state. |
+| | `session_recall` | Exact text from one Claude or Codex session, including what context compaction summarized away: search it with `query`, or read message `[mN]` in full with `message=N`. |
 | | `save_checkpoint` | Save a note plus the brief for the next agent; `apply=true` also writes `.agent-context/HANDOFF.md`. |
 | | `list_agent_memory` | Which instruction and memory files each agent reads, and the rules some agents are missing (drift). |
 | | `suggest_rules` | Mines repeated corrections ("no, use pnpm"), stated preferences and rejected tool calls into rule candidates. |
@@ -113,6 +114,48 @@ To start every Claude Code session with what other agents last did in the repo, 
 ```
 
 The hook prints nothing when there is no other-agent history for the directory. For Codex, Gemini CLI, Cursor or OpenCode, add one line to AGENTS.md or GEMINI.md: *"At the start of a task, call the agent-history `handoff_brief` tool for this repository."*
+
+### Compaction without losing context
+
+Compaction swaps a long conversation for a short summary. On real history it kept a median 12% of tokens in Claude Code and 23% in Codex, and Claude re-read thousands of files it had read before compacting. The transcript on disk still has everything, so two hooks and one tool bring it back:
+
+1. `hook pre-compact` builds a checkpoint from the transcript just before compaction (no model call; about 2 s and under 2k tokens on a 113 MB session). It holds the latest user messages, open todos, files touched, command outcomes, unresolved errors and dead ends.
+2. `hook session-start` sees `"source": "compact"` and puts that checkpoint back into context.
+3. The checkpoint tells the agent to call `session_recall` for anything it still needs word for word.
+
+For Claude Code, add both hooks to `~/.claude/settings.json` (the SessionStart entry also covers the handoff above):
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "agent-history hook pre-compact", "timeout": 120 }] }
+    ],
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "agent-history hook session-start" }] }
+    ]
+  }
+}
+```
+
+A `# Compact instructions` section in CLAUDE.md also steers what the summary keeps.
+
+Codex (0.150 and later) has the same two events, with the same input and output, in `~/.codex/hooks.json`. Approve the new hooks once with `/hooks`:
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "agent-history hook pre-compact --source codex", "timeout": 120 }] }
+    ],
+    "SessionStart": [
+      { "matcher": "compact", "hooks": [{ "type": "command", "command": "agent-history hook session-start --source codex" }] }
+    ]
+  }
+}
+```
+
+`compact_prompt` in `~/.codex/config.toml` steers what the Codex summary keeps.
 
 ## Supported sources
 
@@ -262,6 +305,7 @@ src/agent_history_mcp/
   graph.py         incremental SQLite index and graph search
   search.py        FTS5 + fuzzy keyword search and formatting
   handoff.py       handoff briefs and checkpoints
+  compaction.py    pre-compaction checkpoints and session_recall
   memory_sync.py   instruction/memory discovery, drift, rule mining, managed-block sync
   analytics.py     session analytics and HTML report
   analysis.py      per-session scorecards and instruction suggestions

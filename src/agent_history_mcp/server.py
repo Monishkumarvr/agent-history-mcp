@@ -14,7 +14,7 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import analysis, analytics, handoff, memory_sync, skill_store, skills
+from . import analysis, analytics, compaction, handoff, memory_sync, skill_store, skills
 from .model import agent_home
 from .graph import DEFAULT_DB_PATH, GraphHit, HistoryGraphIndex, format_graph_hits
 from .redact import redact
@@ -160,6 +160,7 @@ mcp = FastMCP(
         "Use search_history to find relevant context from previous sessions in any agent. "
         "Use handoff_brief at the start of work in a repository to see where the last agent stopped. "
         "Prefer search_history over get_session to stay token-efficient. "
+        "After context compaction, use session_recall to get back exact text the summary dropped. "
         "Tools that write files (install_skill, sync_memory, save_checkpoint with apply) only write when apply=true."
     ),
 )
@@ -481,6 +482,38 @@ def handoff_brief(
         return f"Invalid sources. Use {SOURCES_HELP}."
     _refresh_history_index()
     return handoff.handoff_brief(_get_graph_index(), project, valid, sessions, exclude_source)
+
+
+@mcp.tool()
+@_redacted
+def session_recall(
+    session_id: str,
+    query: str = "",
+    source: str = "claude",
+    message: int | None = None,
+    max_hits: int = 5,
+) -> str:
+    """
+    Get back exact text from one session, including what context compaction summarized away.
+
+    session_id: the session to search (the post-compaction checkpoint names it).
+    query: words to find, e.g. an error string, file name or decision.
+    source: claude | codex
+    message: read message [mN] in full instead of searching.
+
+    Reads the transcript on disk directly, so it sees the current, still-running session.
+    """
+    if source not in compaction.RECALL_SOURCES:
+        return f"source must be one of {', '.join(compaction.RECALL_SOURCES)}"
+    root = next((a.root for a in _get_adapters() if a.name == source and a.root), None)
+    path = compaction.find_transcript(session_id, source, root) if root else None
+    if path is None:
+        return f"No {source} transcript found for session '{session_id}'."
+    # ponytail: re-parses the transcript on every call; cache by (path, mtime) if large sessions feel slow.
+    session = compaction.load_session(path, source)
+    if not session:
+        return f"Session '{session_id}' has no messages."
+    return compaction.recall(session, query, message, max_hits)
 
 
 @mcp.tool()
