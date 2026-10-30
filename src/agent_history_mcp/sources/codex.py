@@ -100,6 +100,7 @@ def parse_codex_session_file(path: Path, title_index: dict[str, str] | None = No
     builder.title = next((n for sid, n in index.items() if sid in fname), fname[:60])
     builder.session_date = _date_from_path(path)
     exit_codes: dict[str, int] = {}
+    last_total = None
 
     for obj in read_jsonl(path):
         record_type = obj.get("type")
@@ -119,7 +120,9 @@ def parse_codex_session_file(path: Path, title_index: dict[str, str] | None = No
             builder.add_model(payload.get("model"))
             continue
         if record_type == "compacted":
-            builder.add_signal("compact", "context compacted", ts)
+            pre = builder.calls[-1] if builder.calls else None
+            extra = {"pre_tokens": pre["input"] + pre["cache_read"] + pre["cache_write_5m"]} if pre else {}
+            builder.add_signal("compact", "context compacted", ts, **extra)
             continue
         if record_type == "event_msg":
             event_type = payload.get("type")
@@ -128,6 +131,18 @@ def parse_codex_session_file(path: Path, title_index: dict[str, str] | None = No
                 total = info.get("total_token_usage") if isinstance(info, dict) else None
                 if isinstance(total, dict):
                     builder.set_tokens(total.get("input_tokens"), total.get("output_tokens"))
+                    last = info.get("last_token_usage")
+                    # token_count repeats after non-model events; a new call is a changed running total.
+                    if isinstance(last, dict) and total != last_total:
+                        # input_tokens is the whole prompt; split it into uncached, cached and written.
+                        cached = last.get("cached_input_tokens") or 0
+                        written = last.get("cache_write_input_tokens") or 0
+                        builder.add_call(
+                            ts, builder.models[-1] if builder.models else "", False,
+                            max(0, (last.get("input_tokens") or 0) - cached - written), cached, written, 0,
+                            last.get("output_tokens"), last.get("reasoning_output_tokens"),
+                        )
+                    last_total = total
             elif event_type == "exec_command_end":
                 call_id = payload.get("call_id", "")
                 if isinstance(payload.get("exit_code"), int):

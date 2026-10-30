@@ -422,6 +422,7 @@ class SessionBuilder:
         self.tools_available = True
         self.messages: list[dict] = []
         self.events: list[Event] = []
+        self.calls: list[dict] = []
         self._calls: dict[str, Event] = {}
 
     # metadata
@@ -496,9 +497,19 @@ class SessionBuilder:
             "source": self.source,
         })
 
-    def add_signal(self, signal: str, text: str = "", ts=None) -> None:
+    def add_signal(self, signal: str, text: str = "", ts=None, **meta) -> None:
         iso = self._touch(ts)
-        self._append(Event(0, iso, "system", text[:200], meta={"signal": signal}))
+        self._append(Event(0, iso, "system", text[:200], meta={"signal": signal, **meta}))
+
+    def add_call(self, ts=None, model: str = "", sidechain: bool = False, input_tokens=0, cache_read=0,
+                 cache_write_5m=0, cache_write_1h=0, output_tokens=0, reasoning_tokens=0) -> None:
+        """One model API call. input_tokens is the uncached part; context = input + cache read + cache writes."""
+        self.calls.append({
+            "ts": iso_ts(ts), "model": model or "", "sidechain": sidechain,
+            "input": int(input_tokens or 0), "cache_read": int(cache_read or 0),
+            "cache_write_5m": int(cache_write_5m or 0), "cache_write_1h": int(cache_write_1h or 0),
+            "output": int(output_tokens or 0), "reasoning": int(reasoning_tokens or 0),
+        })
 
     # tools
 
@@ -523,10 +534,12 @@ class SessionBuilder:
         if exit_code is None:
             exit_code = exit_code_from_text(text)
         meta: dict = {}
+        if len(text) > _TOOL_TEXT:  # event text is clipped; keep the real size for token accounting
+            meta["out_chars"] = len(text)
         if is_rejection(text):
             meta["signal"] = "rejected"
         if is_error is None:
-            is_error = (exit_code is not None and exit_code != 0) or bool(meta)
+            is_error = (exit_code is not None and exit_code != 0) or meta.get("signal") == "rejected"
         call = self._calls.get(call_id) if call_id else None
         tool = call.tool if call else name
         canon = call.canon_tool if call else canonical_tool(name)
@@ -565,6 +578,7 @@ class SessionBuilder:
             "source": self.source,
             "messages": self.messages,
             "events": self.events,
+            "calls": sorted(self.calls, key=lambda c: c["ts"] or "~"),
             "cwd": self.cwd,
             "project": project_root(self.cwd) if self.cwd else "",
             "git_branch": self.git_branch,
