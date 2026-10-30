@@ -25,7 +25,13 @@ from .sources.codex import CodexAdapter
 
 
 DEFAULT_DB_PATH = agent_home() / "history_graph.sqlite"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# Graph size knobs. Co-occurrence links grow with the square of the term count
+# per Q&A pair, and related_to with the square of each term's session count.
+COOCCUR_TERMS = 12           # strongest terms per Q&A pair linked to each other (66 pairs)
+RELATED_MAX_DF_SHARE = 0.02  # terms in more than 2% of sessions don't link sessions...
+RELATED_MIN_DF_CAP = 25      # ...unless the corpus is small enough that 2% is under 25
 
 
 @dataclass(frozen=True)
@@ -119,6 +125,7 @@ _COMMON_ERROR_RE = re.compile(
 )
 _API_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){1,4}\b")
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+#.-]{2,}")
+_SIGNAL_CHAR_RE = re.compile(r"[0-9_+#.-]")
 
 
 def _clean_value(value: str) -> str:
@@ -126,7 +133,7 @@ def _clean_value(value: str) -> str:
 
 
 def _norm(value: str) -> str:
-    return re.sub(r"\s+", " ", _clean_value(value).replace("\\", "/").lower())
+    return " ".join(_clean_value(value).replace("\\", "/").lower().split())
 
 
 def _add_term(terms: dict[tuple[str, str], GraphTerm], kind: str, value: str, weight: float) -> None:
@@ -134,6 +141,10 @@ def _add_term(terms: dict[tuple[str, str], GraphTerm], kind: str, value: str, we
     norm = _norm(value)
     if len(norm) < 3:
         return
+    _put_term(terms, kind, value, norm, weight)
+
+
+def _put_term(terms: dict[tuple[str, str], GraphTerm], kind: str, value: str, norm: str, weight: float) -> None:
     key = (kind, norm)
     existing = terms.get(key)
     if existing is None or weight > existing.weight:
@@ -179,14 +190,9 @@ def extract_graph_terms(text: str, max_terms: int = 80) -> list[GraphTerm]:
         if norm.startswith(("http", "www")):
             continue
         word_items.append((raw, norm))
-        signal = (
-            any(ch.isdigit() for ch in raw)
-            or any(ch in raw for ch in ("_", "-", "+", "#", "."))
-            or raw.isupper()
-            or len(norm) >= 4
-        )
+        signal = len(norm) >= 4 or raw.isupper() or _SIGNAL_CHAR_RE.search(raw)
         if signal:
-            _add_term(terms, "topic", raw, 1.0 if raw.islower() else 1.4)
+            _put_term(terms, "topic", raw, norm, 1.0 if raw.islower() else 1.4)
 
     compact_words = [(raw, norm) for raw, norm in word_items if norm not in _STOP_WORDS]
     for size, weight in ((2, 2.0), (3, 2.4)):
@@ -195,8 +201,7 @@ def extract_graph_terms(text: str, max_terms: int = 80) -> list[GraphTerm]:
             norms = [n for _r, n in chunk]
             if len(set(norms)) != len(norms):
                 continue
-            phrase = " ".join(raw for raw, _n in chunk)
-            _add_term(terms, "topic", phrase, weight)
+            _put_term(terms, "topic", " ".join(raw for raw, _n in chunk), " ".join(norms), weight)
 
     return sorted(terms.values(), key=lambda t: (-t.weight, t.kind, t.norm))[:max_terms]
 
@@ -539,28 +544,22 @@ class HistoryGraphIndex:
         self.conn.commit()
         return stats
 
-    def _insert_node(self, node_key: str, kind: str, value: str) -> None:
-        self.conn.execute(
+    def _insert_nodes(self, nodes: dict[str, tuple[str, str]]) -> None:
+        """nodes maps node_key -> (kind, value); an existing node keeps its first value."""
+        self.conn.executemany(
             "INSERT OR IGNORE INTO nodes(node_key, kind, value) VALUES (?, ?, ?)",
-            (node_key, kind, value),
+            [(key, kind, value) for key, (kind, value) in nodes.items()],
         )
 
-    def _insert_edge(
-        self,
-        src_key: str,
-        dst_key: str,
-        relation: str,
-        weight: float = 1.0,
-        evidence: str | None = None,
-    ) -> None:
-        self.conn.execute(
+    def _insert_edges(self, edges: list[tuple[str, str, str, float]]) -> None:
+        """edges are (src_key, dst_key, relation, weight); a repeated edge takes the later weight."""
+        self.conn.executemany(
             """
-            INSERT INTO edges(src_key, dst_key, relation, weight, provenance, confidence, evidence)
-            VALUES (?, ?, ?, ?, 'EXTRACTED', 1.0, ?)
-            ON CONFLICT(src_key, dst_key, relation)
-            DO UPDATE SET weight = excluded.weight, evidence = COALESCE(excluded.evidence, edges.evidence)
+            INSERT INTO edges(src_key, dst_key, relation, weight, provenance, confidence)
+            VALUES (?, ?, ?, ?, 'EXTRACTED', 1.0)
+            ON CONFLICT(src_key, dst_key, relation) DO UPDATE SET weight = excluded.weight
             """,
-            (src_key, dst_key, relation, weight, evidence),
+            edges,
         )
 
     def _delete_session(self, session_key: str) -> None:
@@ -587,7 +586,12 @@ class HistoryGraphIndex:
         source = session["source"]
         session_id = session["session_id"]
         session_key = _session_key(source, session_id)
-        self._insert_node(session_key, "session", session["session_title"])
+        # Rows are collected per session and written with executemany: one execute per row was
+        # about a fifth of the whole build.
+        nodes: dict[str, tuple[str, str]] = {session_key: ("session", session["session_title"])}
+        edges: list[tuple[str, str, str, float]] = []
+        message_rows: list[tuple] = []
+        message_term_rows: list[tuple[str, str, float]] = []
         events = session.get("events") or []
         self.conn.execute(
             """
@@ -637,49 +641,47 @@ class HistoryGraphIndex:
                 if len(norm) < 3:
                     continue
                 term = GraphTerm(kind=kind, value=_clean_value(value), norm=norm, weight=weight)
-                self._insert_node(term.key, term.kind, term.value)
+                nodes.setdefault(term.key, (term.kind, term.value))
                 session_term_weights[term.key] += weight
 
         for idx, msg in enumerate(session["messages"]):
             message_key = _message_key(source, session_id, idx)
-            self._insert_node(message_key, "message", f"{source}:{session_id}:{idx}")
-            self.conn.execute(
-                """
-                INSERT OR REPLACE INTO messages(message_key, session_key, msg_idx, role, text, ts)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (message_key, session_key, idx, msg["role"], msg["text"], msg.get("ts", "")),
-            )
-            self._insert_edge(session_key, message_key, "contains_message", 1.0)
+            nodes.setdefault(message_key, ("message", f"{source}:{session_id}:{idx}"))
+            message_rows.append((message_key, session_key, idx, msg["role"], msg["text"], msg.get("ts", "")))
+            edges.append((session_key, message_key, "contains_message", 1.0))
 
             terms = extract_graph_terms(msg["text"], max_terms=60)
             message_terms_by_idx[idx] = terms
             for term in terms:
-                self._insert_node(term.key, term.kind, term.value)
-                self.conn.execute(
-                    """
-                    INSERT OR REPLACE INTO message_terms(message_key, term_key, weight)
-                    VALUES (?, ?, ?)
-                    """,
-                    (message_key, term.key, term.weight),
-                )
+                nodes.setdefault(term.key, (term.kind, term.value))
+                message_term_rows.append((message_key, term.key, term.weight))
                 session_term_weights[term.key] += term.weight
-                self._insert_edge(message_key, term.key, f"mentions_{term.kind}", term.weight)
 
-        for term_key, weight in session_term_weights.items():
-            self.conn.execute(
-                """
-                INSERT OR REPLACE INTO session_terms(session_key, term_key, weight)
-                VALUES (?, ?, ?)
-                """,
-                (session_key, term_key, weight),
-            )
-            self._insert_edge(session_key, term_key, "mentions_topic", weight)
-
-        self._index_qa_and_cooccurrence(session, message_terms_by_idx)
+        edges.extend(self._qa_and_cooccurrence_edges(session, message_terms_by_idx))
+        self._insert_nodes(nodes)
+        self.conn.executemany(
+            """
+            INSERT OR REPLACE INTO messages(message_key, session_key, msg_idx, role, text, ts)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            message_rows,
+        )
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO message_terms(message_key, term_key, weight) VALUES (?, ?, ?)",
+            message_term_rows,
+        )
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO session_terms(session_key, term_key, weight) VALUES (?, ?, ?)",
+            [(session_key, term_key, weight) for term_key, weight in session_term_weights.items()],
+        )
+        self._insert_edges(edges)
         return session_key
 
-    def _index_qa_and_cooccurrence(self, session: dict, message_terms_by_idx: dict[int, list[GraphTerm]]) -> None:
+    @staticmethod
+    def _qa_and_cooccurrence_edges(
+        session: dict, message_terms_by_idx: dict[int, list[GraphTerm]]
+    ) -> list[tuple[str, str, str, float]]:
+        edges: list[tuple[str, str, str, float]] = []
         source = session["source"]
         session_id = session["session_id"]
         messages = session["messages"]
@@ -697,24 +699,32 @@ class HistoryGraphIndex:
 
             question_key = _message_key(source, session_id, idx)
             answer_key = _message_key(source, session_id, answer_idx)
-            self._insert_edge(question_key, answer_key, "answered_by", 1.0)
+            edges.append((question_key, answer_key, "answered_by", 1.0))
 
             combined = {
                 term.key: term
                 for term in [*message_terms_by_idx.get(idx, []), *message_terms_by_idx.get(answer_idx, [])]
             }
-            qa_terms = sorted(combined.values(), key=lambda t: (-t.weight, t.norm))[:30]
+            qa_terms = sorted(combined.values(), key=lambda t: (-t.weight, t.norm))[:COOCCUR_TERMS]
             for left_index, left in enumerate(qa_terms):
                 for right in qa_terms[left_index + 1:]:
                     src, dst = sorted((left.key, right.key))
                     weight = min(left.weight, right.weight)
-                    self._insert_edge(src, dst, "co_occurs_with", weight)
+                    edges.append((src, dst, "co_occurs_with", weight))
+        return edges
 
     def _rebuild_related_sessions(self) -> None:
         self.conn.execute("DELETE FROM edges WHERE relation = 'related_to'")
+        # Terms shared by many sessions (git status, a common word) relate nothing and
+        # make the self-join quadratic, so only fairly specific terms link sessions.
+        n_sessions = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        max_df = max(RELATED_MIN_DF_CAP, int(n_sessions * RELATED_MAX_DF_SHARE))
         self.conn.execute(
             """
             INSERT OR REPLACE INTO edges(src_key, dst_key, relation, weight, provenance, confidence, evidence)
+            WITH specific AS (
+                SELECT term_key FROM session_terms GROUP BY term_key HAVING COUNT(*) BETWEEN 2 AND ?
+            )
             SELECT
                 a.session_key,
                 b.session_key,
@@ -723,11 +733,13 @@ class HistoryGraphIndex:
                 'EXTRACTED',
                 1.0,
                 'shared extracted topics'
-            FROM session_terms a
-            JOIN session_terms b ON a.term_key = b.term_key AND a.session_key < b.session_key
+            FROM specific t
+            JOIN session_terms a ON a.term_key = t.term_key
+            JOIN session_terms b ON b.term_key = t.term_key AND a.session_key < b.session_key
             GROUP BY a.session_key, b.session_key
             HAVING COUNT(*) >= 2 AND SUM(min(a.weight, b.weight)) >= 4.0
-            """
+            """,
+            (max_df,),
         )
 
     def search(self, query: str, sources: list[str], max_results: int = 5) -> list[GraphHit]:
