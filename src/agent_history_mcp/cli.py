@@ -6,6 +6,8 @@ scripts, and agent hooks.
   agent-history handoff [--project .] print a cross-agent handoff brief
   agent-history hook session-start    Claude Code SessionStart hook (reads JSON on stdin)
   agent-history hook pre-compact      PreCompact hook: checkpoint the session before compaction
+  agent-history hook pre-tool-use     PreToolUse hook: stop re-reading an unchanged file
+  agent-history reread-guard on|off   switch that hook on or off
   agent-history report                write the HTML history report
   agent-history token-report          where the tokens went (cache, idle gaps, compactions)
   agent-history --help                list every command
@@ -36,13 +38,14 @@ def _emit_context(context: str) -> None:
 
 
 def _pre_compact_hook(args: argparse.Namespace) -> int:
-    from . import compaction
+    from . import compaction, reread
 
     payload = _read_payload()
     transcript, session_id = payload.get("transcript_path"), payload.get("session_id")
     if not transcript or not session_id:
         return 0
     try:
+        reread.reset(str(session_id))  # compaction drops earlier reads from context
         compaction.write_checkpoint(Path(transcript), str(session_id), args.source, str(payload.get("trigger") or ""))
     except Exception as exc:  # a broken checkpoint must never block compaction
         print(f"agent-history: compaction checkpoint skipped: {exc}", file=sys.stderr)
@@ -75,6 +78,21 @@ def _session_start_hook(args: argparse.Namespace) -> int:
         "(via agent-history-mcp; call handoff_brief or search_history for more):\n\n" + brief
     )
     _emit_context(context)
+    return 0
+
+
+def _pre_tool_use_hook(args: argparse.Namespace) -> int:
+    from . import reread
+
+    try:
+        reason = reread.check(_read_payload())
+    except Exception as exc:  # a broken guard must never block a tool call
+        print(f"agent-history: re-read guard skipped: {exc}", file=sys.stderr)
+        return 0
+    if reason:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason,
+        }}))
     return 0
 
 
@@ -164,6 +182,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--days-back", type=int, default=60)
     s.add_argument("--project")
 
+    p = sub.add_parser("reread-guard", help="turn the re-read guard hook on or off")
+    p.add_argument("state", nargs="?", choices=["on", "off", "status"], default="status")
+
     p = sub.add_parser("hook", help="agent hook entry points")
     hook_sub = p.add_subparsers(dest="hook")
     h = hook_sub.add_parser("session-start", help="Claude Code SessionStart hook: inject other agents' recent context")
@@ -174,26 +195,35 @@ def build_parser() -> argparse.ArgumentParser:
     h = hook_sub.add_parser("pre-compact", help="PreCompact hook: save a checkpoint that session-start re-injects after compaction")
     h.add_argument("--source", default="claude", choices=["claude", "codex"], help="agent running the hook (default: claude)")
 
+    hook_sub.add_parser("pre-tool-use", help="Claude Code PreToolUse hook (matcher Read): deny re-reading an unchanged file")
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    from . import server
-
     command = args.command or "serve"
-    if command == "serve":
-        server.run()
-        return 0
-    if command == "hook":
+    if command == "hook":  # before importing the server: mcp takes ~1.3 s to import, and hooks run per tool call
         if args.hook == "session-start":
             return _session_start_hook(args)
         if args.hook == "pre-compact":
             return _pre_compact_hook(args)
+        if args.hook == "pre-tool-use":
+            return _pre_tool_use_hook(args)
         parser.parse_args(["hook", "--help"])
         return 2
+    if command == "reread-guard":
+        from . import reread
 
+        print(reread.status() if args.state == "status" else reread.set_enabled(args.state == "on"))
+        return 0
+
+    from . import server
+
+    if command == "serve":
+        server.run()
+        return 0
     if command == "refresh":
         out = server.refresh_history_index(rebuild=args.rebuild)
     elif command == "search":

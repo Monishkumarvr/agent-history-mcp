@@ -103,6 +103,8 @@ agent-history rules --min-sessions 2
 agent-history sync-memory                    # dry-run diff
 agent-history hook pre-compact               # PreCompact hook (--source codex for Codex)
 agent-history hook session-start             # SessionStart hook: handoff, or the checkpoint after compaction
+agent-history hook pre-tool-use              # PreToolUse hook (matcher Read): stop re-reading unchanged files
+agent-history reread-guard off               # switch that hook off (on / status)
 agent-history                                # runs the MCP server
 ```
 
@@ -163,6 +165,22 @@ Codex (0.150 and later) has the same two events, with the same input and output,
 ```
 
 `compact_prompt` in `~/.codex/config.toml` steers what the Codex summary keeps.
+
+### Stop re-reading unchanged files (Claude Code)
+
+On real history about half of Claude's `Read` calls fetched a path the session had already read, with no edit or compaction in between. Each copy stays in context and is re-sent on every later call. `hook pre-tool-use` remembers each Read (path, line range, file mtime and size) and denies a repeat of the same range of an unchanged file, saying when it was read. Repeating the Read lets it through, for when the earlier output is really gone from context. A subagent keeps its own list, and `hook pre-compact` clears the list, since compaction drops the earlier reads.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Read", "hooks": [{ "type": "command", "command": "agent-history hook pre-tool-use" }] }
+    ]
+  }
+}
+```
+
+It adds about 0.3 s per Read. `agent-history reread-guard off` turns it off (and `on` back on) from the next Read, without editing settings. Codex reads files through shell commands, so there is no Codex version.
 
 ## Supported sources
 
