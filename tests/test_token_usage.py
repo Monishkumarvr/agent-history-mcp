@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent_history_mcp.graph import HistoryGraphIndex
 from agent_history_mcp.sources.claude import parse_claude_session_file
 from agent_history_mcp.sources.codex import parse_codex_session_file
+from agent_history_mcp.tokens import token_report
 
 from fixtures import _append, all_adapters
 
@@ -101,6 +102,18 @@ class TokenUsageTests(unittest.TestCase):
                 self.assertEqual(len(index.calls_for(row["session_key"])), count)
         finally:
             index.close()
+
+    def test_token_report(self):
+        index = HistoryGraphIndex(self.root / "graph.sqlite")
+        try:
+            index.refresh(adapters=all_adapters(self.root))
+            report = token_report(index)
+        finally:
+            index.close()
+        self.assertIn("4 model calls in 2 sessions", report)
+        self.assertIn("- claude: 1 gaps, 900 tokens written", report)  # 5m25s between the two calls
+        self.assertIn("- claude: 1 compactions, median 210.0k → median 22.0k", report)
+        self.assertRegex(report, r"Read\s+1\s+1\.2k\s+0\n")  # compacted before any later call
 
 
 if __name__ == "__main__":
