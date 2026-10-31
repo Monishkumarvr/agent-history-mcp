@@ -93,6 +93,7 @@ agent-history handoff --project .            # brief for this repo
 agent-history checkpoint "Paused: waiting on API keys"
 agent-history analyze --days-back 7 --group-by source
 agent-history report                         # HTML report path
+agent-history token-report --days-back 0      # cache hits, idle re-writes, compactions, re-sent output
 agent-history skills suggest
 agent-history skills draft wf-1a2b3c4d5e6f > SKILL.md
 agent-history skills install --file SKILL.md --apply

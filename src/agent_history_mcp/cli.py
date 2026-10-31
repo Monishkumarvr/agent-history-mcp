@@ -7,6 +7,7 @@ scripts, and agent hooks.
   agent-history hook session-start    Claude Code SessionStart hook (reads JSON on stdin)
   agent-history hook pre-compact      PreCompact hook: checkpoint the session before compaction
   agent-history report                write the HTML history report
+  agent-history token-report          where the tokens went (cache, idle gaps, compactions)
   agent-history --help                list every command
 """
 
@@ -135,6 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days-back", type=int, default=30)
     p.add_argument("--sources", default="all")
 
+    p = sub.add_parser("token-report", help="where tokens went: cache hits, idle re-writes, compactions, re-sent output")
+    p.add_argument("--project")
+    p.add_argument("--days-back", type=int, default=30)
+    p.add_argument("--sources", default="all")
+    p.add_argument("--top", type=int, default=10)
+
     p = sub.add_parser("skills", help="suggest, draft, install and check skills")
     skills_sub = p.add_subparsers(dest="skills_cmd")
     s = skills_sub.add_parser("suggest")
@@ -207,6 +214,13 @@ def main(argv: list[str] | None = None) -> int:
         out = server.analyze_sessions(args.project, args.days_back or None, _sources(args.sources), args.group_by)
     elif command == "report":
         out = server.history_report(args.project, args.days_back or None, _sources(args.sources))
+    elif command == "token-report":
+        from . import handoff, tokens
+
+        valid = server.resolve_sources(_sources(args.sources))
+        server._refresh_history_index()
+        root = handoff.resolve_project(args.project) if args.project else None
+        out = tokens.token_report(server._get_graph_index(), valid, root, args.days_back or None, args.top)
     elif command == "skills":
         if args.skills_cmd == "suggest":
             out = server.suggest_skills(_sources(args.sources), args.max_candidates, args.min_sessions, args.days_back, True, args.project)
@@ -223,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         parser.print_help()
         return 2
+    if hasattr(sys.stdout, "reconfigure"):  # piped on Windows, stdout is cp1252 and can't print → or emoji in titles
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(out)
     return 0
 
